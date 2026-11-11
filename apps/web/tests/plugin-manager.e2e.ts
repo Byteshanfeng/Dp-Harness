@@ -206,6 +206,21 @@ describe('web e2e: plugin manager', () => {
             if (pinned !== undefined) expect(placement).toBe(pinned)
             facts.push(`${language} ${width}px: actions ${pinned === undefined ? 'beside or below (according to intrinsic fit)' : placement} the heading, single-line; contained; information follows subtitle; focus retained`)
           }
+          // 安装任务会把添加按钮换成更宽的文案，宽度可能在页头完成初始测量后变化。
+          await add.evaluate((element) => { element.style.width = '130px'; element.style.minWidth = '130px' })
+          try {
+            expect(await header.evaluate((element) => {
+              const buttons = element.querySelectorAll('[data-plugin-toolbar] button')
+              const refresh = buttons[0]!.getBoundingClientRect()
+              const add = buttons[1]!.getBoundingClientRect()
+              const head = element.getBoundingClientRect()
+              return refresh.top === add.top && refresh.right + 8 <= add.left && add.bottom <= head.bottom
+                && document.elementFromPoint(add.left + add.width / 2, add.top + add.height / 2)?.closest('button') === buttons[1]
+            })).toBe(true)
+            facts.push(`${language} 1024px: a wider installation action stays beside Refresh and inside the header`)
+          } finally {
+            await add.evaluate((element) => { element.style.removeProperty('width'); element.style.removeProperty('min-width') })
+          }
           // Force less room than even the icon actions need beside the heading.
           await probe.setViewportSize({ width: 240, height: 1000 })
           const previousWrap = await header.evaluate((element) => {

@@ -7,6 +7,7 @@ en 440px: actions beside or below (according to intrinsic fit) the heading, sing
 en 390px: actions beside or below (according to intrinsic fit) the heading, single-line; contained; information follows subtitle; focus retained
 en 430px: actions beside or below (according to intrinsic fit) the heading, single-line; contained; information follows subtitle; focus retained
 en 1024px: actions beside the heading, single-line; contained; information follows subtitle; focus retained
+en 1024px: a wider installation action stays beside Refresh and inside the header
 zh 1680px: actions beside the heading, single-line; contained; information follows subtitle; focus retained
 zh 768px: actions beside or below (according to intrinsic fit) the heading, single-line; contained; information follows subtitle; focus retained
 zh 520px: actions beside or below (according to intrinsic fit) the heading, single-line; contained; information follows subtitle; focus retained
@@ -14,6 +15,7 @@ zh 440px: actions beside or below (according to intrinsic fit) the heading, sing
 zh 390px: actions beside or below (according to intrinsic fit) the heading, single-line; contained; information follows subtitle; focus retained
 zh 430px: actions beside or below (according to intrinsic fit) the heading, single-line; contained; information follows subtitle; focus retained
 zh 1024px: actions beside the heading, single-line; contained; information follows subtitle; focus retained
+zh 1024px: a wider installation action stays beside Refresh and inside the header
 
 A forced no-wrap layout at 240px fails the same measured layout check in both locales; restoring wrap and 390px passes.
 Add menu dismisses on Escape and returns focus in both locales.
