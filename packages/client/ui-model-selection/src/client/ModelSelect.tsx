@@ -45,7 +45,7 @@ import css from './ModelSelect.module.css'
 import { orderModelProviders } from './provider-order.ts'
 
 /** Which pane the dropdown shows: the two-row root or one drilled-in list. */
-type Pane = 'root' | 'model' | 'effort'
+type Pane = 'root' | 'model' | 'effort' | `option:${string}`
 
 /** One dynamic effort row; undefined means preserve the provider default. */
 interface EffortChoice {
@@ -176,7 +176,7 @@ export function ModelSelect(
 
   // Pane switches unmount the focused row; restore focus inside the menu so
   // keyboard navigation remains available.
-  const paneFocus = useRef<'drill' | 'model' | 'effort' | null>(null)
+  const paneFocus = useRef<'drill' | Exclude<Pane, 'root'> | null>(null)
   const previousShowSearch = useRef(showSearch)
   useEffect(() => {
     const changedSearchMode = previousShowSearch.current !== showSearch
@@ -196,6 +196,12 @@ export function ModelSelect(
       // Rows a selection in flight disabled cannot take the keyboard; the
       // trigger does, so the card's keys still reach the menu.
       ;(target ?? triggerRef.current)?.focus()
+      return
+    }
+    if (intent.startsWith('option:')) {
+      const cell = Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>('[data-model-option-id]') ?? [])
+        .find(item => item.dataset.modelOptionId === intent.slice('option:'.length))
+      ;(cell ?? triggerRef.current)?.focus()
       return
     }
     const cell = itemRefs.current[intent === 'effort' ? 1 : 0]
@@ -249,6 +255,8 @@ export function ModelSelect(
     paneFocus.current = 'drill'
     setPane(next)
   }
+
+  const openOption = (id: string): void => { drill(`option:${id}`) }
 
   /** Leave a drilled pane for the root one, handing the keyboard back to its cell. */
   const back = (from: Exclude<Pane, 'root'>): void => {
@@ -502,14 +510,6 @@ export function ModelSelect(
                   <IconChevronRightOutlineRegular className={css.cellChevron} />
                 </button>
               )}
-              {renderSlot('conversation.input.model.options', {
-                locked: locked || busy,
-                dismiss: () => {
-                  close()
-                  triggerRef.current?.focus()
-                },
-                reportFailure: (message) => { setToast({ seq: ++toastSeq.current, text: message }) },
-              })}
             </>
           )}
 
@@ -652,6 +652,17 @@ export function ModelSelect(
               </div>
             </>
           )}
+          {renderSlot('conversation.input.model.options', {
+            locked: locked || busy,
+            visible: pane === 'root' || pane.startsWith('option:'),
+            activeOption: pane.startsWith('option:') ? pane.slice('option:'.length) : null,
+            openOption,
+            dismiss: () => {
+              close()
+              triggerRef.current?.focus()
+            },
+            reportFailure: (message) => { setToast({ seq: ++toastSeq.current, text: message }) },
+          })}
         </MenuSurface>,
         document.body,
       )}

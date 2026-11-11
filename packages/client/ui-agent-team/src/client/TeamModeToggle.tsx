@@ -29,7 +29,7 @@ export type TeamModeToggleProps = PropsRuntime<'conversation.input.model.options
 export function TeamModeToggle(props: TeamModeToggleProps) {
   const addressedChild = props.useSession(snapshot => snapshot.subagent !== null)
   const listedChild = props.useSessions(state => state.byId[props.sessionId]?.origin === 'subagent')
-  if (addressedChild || listedChild) return null
+  if (addressedChild || listedChild || !props.visible || props.activeOption !== null) return null
   return <RootTeamModeToggle {...props} />
 }
 

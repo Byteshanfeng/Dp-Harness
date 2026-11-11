@@ -26,6 +26,12 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
       owner: {
         /** Whether the composer currently refuses selection changes. */
         locked: boolean
+        /** Whether this contribution belongs to the displayed menu pane. */
+        visible: boolean
+        /** Active contributed pane, or null while the root pane is displayed. */
+        activeOption: string | null
+        /** Open a contributed option list inside the existing menu. */
+        openOption: (id: string) => void
         /** Close the menu and focus its trigger synchronously before opening another overlay. */
         dismiss: () => void
         /** Report a failed selection through the menu owner's persistent toast. */

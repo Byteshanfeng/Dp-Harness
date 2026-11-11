@@ -69,6 +69,7 @@ kind: "package-group"
 | [`ui-jobs/`](ui-jobs/README.zh.md) | 列出本会话的后台任务，并提供按需展开的流式输出面板 | — |
 | [`ui-schedule/`](ui-schedule/README.zh.md) | 提供侧栏“自动化任务”页面与右侧栏任务页签，用于创建、编辑、立即运行、暂停、恢复和删除宿主的计划任务，并提供 Session 顶部时钟与行标记 | — |
 | [`ui-model-selection/`](ui-model-selection/README.zh.md) | 在对话界面中提供模型选择 | — |
+| [`ui-image-model-selection/`](ui-image-model-selection/README.zh.md) | 在对话菜单中选择已配置的生图工具模型 | — |
 | [`ui-permission-presets/`](ui-permission-presets/README.zh.md) | 配置默认权限并切换当前会话的访问模式 | — |
 | [`ui-plan/`](ui-plan/README.zh.md) | 展示生效中的 plan mode 状态及其退出控件 | — |
 | [`ui-settings-plugins/`](ui-settings-plugins/README.zh.md) | 负责「内置插件」设置分区壳及其标签页扩展点 | — |

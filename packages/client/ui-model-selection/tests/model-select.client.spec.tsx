@@ -1135,3 +1135,26 @@ it('dismisses contributed options with focus on the trigger before opening anoth
   })
   expect(screen.queryByRole('menu')).toBeNull()
 })
+
+it('opens a contributed choice pane and returns focus to its root row', () => {
+  const renderOption: ComponentProps<typeof ModelSelect>['renderSlot'] = (name, owner, options) => {
+    if (name === 'conversation.input.model.label') return options?.fallback ?? null
+    const { visible, activeOption, openOption } = owner as Partial<OwnerOf<'conversation.input.model.options'>>
+    if (!visible) return null
+    if (activeOption === null) return <button type="button" role="menuitem" data-model-option-id="image-model"
+      onClick={() => { openOption?.('image-model') }}>Image model</button>
+    if (activeOption === 'image-model') return <button type="button" role="menuitemradio" aria-checked="true">Gemini image</button>
+    return null
+  }
+  render(<ModelSelect locked={false} available directory={createSnapshotStore(state())}
+    load={vi.fn()} resolveText={resolveText} select={vi.fn()} t={t} renderSlot={renderOption} />)
+  fireEvent.click(screen.getByRole('button', { name: /^选择模型/ }))
+  const row = screen.getByRole('menuitem', { name: 'Image model' })
+  fireEvent.click(row)
+  const choice = screen.getByRole('menuitemradio', { name: 'Gemini image' })
+  expect(document.activeElement).toBe(choice)
+  expect(screen.queryByRole('menuitem', { name: /^模型/ })).toBeNull()
+  fireEvent.keyDown(choice, { key: 'Escape' })
+  expect(document.activeElement).toBe(screen.getByRole('menuitem', { name: 'Image model' }))
+  expect(screen.queryByRole('menuitemradio', { name: 'Gemini image' })).toBeNull()
+})
