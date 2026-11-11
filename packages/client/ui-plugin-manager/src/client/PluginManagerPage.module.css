@@ -205,7 +205,7 @@
 .toolbar {
   display: flex;
   flex: 0 1 auto;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: flex-end;
   gap: 8px 16px;
@@ -1807,6 +1807,7 @@ label.registryOption {
   /* The icon actions keep their width; a wrapped update note stays within the head. */
   .toolbar {
     flex-shrink: 0;
+    flex-wrap: wrap;
     max-width: 100%;
   }
 
