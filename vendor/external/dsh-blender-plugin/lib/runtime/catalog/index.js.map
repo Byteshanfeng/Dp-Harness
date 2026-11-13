@@ -1,0 +1,1 @@
+{"version":3,"file":"index.js","sourceRoot":"","sources":["../../../runtime/catalog/index.ts"],"names":[],"mappings":"AAAA,4BAA4B;AAC5B,cAAc,WAAW,CAAA;AACzB,cAAc,YAAY,CAAA;AAC1B,cAAc,eAAe,CAAA;AAC7B,cAAc,YAAY,CAAA","sourcesContent":["// catalog 模块入口（拆分）：数据表 + 逻辑\nexport * from './data.js'\nexport * from './tools.js'\nexport * from './commands.js'\nexport * from './logic.js'\n"]}

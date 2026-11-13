@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1104" height="1088" viewBox="0 0 1104 1088">
+  <defs>
+    <linearGradient id="tile" x1="40" y1="32" x2="1064" y2="1056" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f8fbff"/>
+      <stop offset="1" stop-color="#e5edfa"/>
+    </linearGradient>
+    <filter id="filter0_d_1637_371" filterUnits="userSpaceOnUse" x="0" y="0" width="1104" height="1088" color-interpolation-filters="sRGB">
+      <feDropShadow dy="16" stdDeviation="16" flood-color="#2b4265" flood-opacity=".18"/>
+    </filter>
+    <filter id="filter1_ddi_1637_371" filterUnits="userSpaceOnUse" x="240" y="232" width="624" height="624" color-interpolation-filters="sRGB">
+      <feDropShadow dy="8" stdDeviation="12" flood-color="#6d829e" flood-opacity=".22"/>
+    </filter>
+  </defs>
+  <g filter="url(#filter0_d_1637_371)">
+    <rect x="40" y="32" width="1024" height="1024" fill="url(#tile)"/>
+  </g>
+  <g filter="url(#filter1_ddi_1637_371)">
+    <g transform="translate(264 256) scale(12)">
+      <path fill="#17243b" fill-rule="evenodd" d="M12 2h24c5.523 0 10 4.477 10 10v24c0 5.523-4.477 10-10 10H12C6.477 46 2 41.523 2 36V12C2 6.477 6.477 2 12 2Zm0 12v6h9v16h6V20h9v-6H12Z"/>
+    </g>
+  </g>
+</svg>

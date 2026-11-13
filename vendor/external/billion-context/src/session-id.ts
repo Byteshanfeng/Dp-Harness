@@ -1,0 +1,571 @@
+import { pckKeyAbated } from "./pck-probe.js";
+import { isCodexClient } from "./codex-compact.js";
+import { claudeLaneTokenIn } from "./claude-lane-token.js";
+import { resolveWireClientProfile } from "./server/lane-decisions.js";
+import type { PromptCacheRouting } from "./config.js";
+
+export type ConversationIdentity = {
+    value: string;
+    source: "header" | "body-session" | "metadata-session" | "previous-response" | "prompt-cache-key" | "content-fingerprint" | "generated";
+    clientProvided: boolean;
+};
+
+/**
+ * Session identity for the proxy's OWN compression state.
+ *
+ * The session ID is the client-provided conversation value VERBATIM — no hash,
+ * no other dimensions. The client explicitly states which conversation this
+ * is (codex `session-id`/`thread-id`, claude `x-claude-code-session-id`,
+ * opencode `x-opencode-session`, Responses body `session_id` /
+ * `metadata.session_id`, `prompt_cache_key`, ...), and that value is the only
+ * invariant that actually binds to the conversation. Everything else is
+ * mutable mid-conversation and must not break session continuity (#280, #286):
+ * credentials rotate (ChatGPT OAuth bearers), users switch relays/upstreams,
+ * and the wire protocol itself can change (relay translation, cross-protocol
+ * model switches).
+ *
+ * A protocol switch is safe under one id because session state is
+ * protocol-neutral (kernel-normalized CompressionState, text block contents,
+ * CoreMessage snapshots) and the client re-sends the full history every turn,
+ * where the current protocol's adapter re-normalizes it.
+ *
+ * Requests WITHOUT a client-provided identity are rejected with 400 by the
+ * server: the content-fingerprint fallback has a real collision surface and
+ * would silently orphan state, so anonymous requests fail explicitly instead.
+ *
+ * The id is used ONLY inside the proxy (compression-state store, persistence,
+ * UI label). It is NEVER sent upstream — if a per-conversation signal is
+ * needed for upstream routing, use `affinityToken()` below.
+ */
+
+/** Pull a client-provided conversation signal from headers, if any. */
+export function clientConversationHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
+    return conversationHeaderSource(headers)?.value;
+}
+
+/** Same header walk as clientConversationHeader, but also reports WHICH header
+ *  won — needed by callers whose trust decision depends on the signal's origin
+ *  (#1102), not just its value. */
+export function conversationHeaderSource(headers: Record<string, string | string[] | undefined>): { name: string; value: string } | undefined {
+    // x-bili-plugin-conversation first: a cooperative plugin's explicit
+    // statement of which conversation it is driving (see src/plugin.ts).
+    // It outranks every other signal — the plugin owns the session identity
+    // in plugin mode (this is what fixes pi's content-fingerprint collision
+    // risk for plugin-equipped agents). Honored ONLY when the plugin marker
+    // header x-bili-plugin is present: the protocol always sends both
+    // together, and trusting a plugin-protocol header from any client would
+    // let an unauthenticated LAN client steer the proxy's session identity.
+    // x-claude-code-session-id next: the CLI's true per-session UUID — the
+    // strongest legacy signal. The name is client-specific, so no other agent
+    // (opencode/codex/zcode/curl) ever hits it; their own headers are
+    // unchanged below.
+    // x-grok-session-id next: grok-shell (xAI's CLI) stamps its per-session
+    // UUID on every model request (verified against grok-shell 1.0.34; the
+    // parallel x-grok-conv-id carries the same value and stays as a
+    // fallback). Client-specific name — same trust class as the claude
+    // header above: without it the request is anonymous and falls to
+    // prefix-affinity, which forks every turn because grok-shell reorders
+    // its replayed history head between turns.
+    // x-mavis-session-id: MiniMax Code (mcode) stamps its per-conversation id
+    // on every model request (#1050). Client-specific name — same trust class
+    // as the claude/grok headers above.
+    // agent-session-id: goose stamps its sqlite sessions.id (default
+    // YYYYMMDD_<n>, stable across restarts) on every model request, BYOK and
+    // custom-provider paths included (#5825); a user-overridden header name
+    // simply degrades this lane. Client-specific name — same trust class as
+    // the headers above.
+    // x-opencode-session-id: OpenCode 2.x stamps the request's OWN session id
+    // here on every model request, while x-session-affinity / X-Session-Id /
+    // x-opencode-session all carry the INHERITED cache-routing affinity
+    // (parentID ?? fork source ?? own id — the provider prefix-cache grouping
+    // key, verified against opencode core model-request.ts + affinity.ts).
+    // Keying on the affinity would merge a parent and all of its subagent/
+    // fork siblings onto one mutable ACP state (#2779). 1.x stamped its own
+    // id into those affinity headers instead, so this restores 1.x isolation
+    // for 2.x traffic and is inert for 1.x (header absent); root sessions are
+    // unchanged either way (affinity === own id). Client-specific name — same
+    // trust class as the headers above.
+    // x-conversation-id: CodeBuddy (`bili n`) stamps its persisted
+    // conversation object id on every model request — measured 2.181.0 across
+    // fresh/-c/-r processes: stable across restarts, survives compaction
+    // (#5825, decision A: merge low-trust recognition; per-message identity
+    // rides the transcript.jsonl harvest in src/identity-codebuddy.ts).
+    // Client-specific name; placed AFTER every stricter client header and the
+    // affinity tier, before the bare generic `session-id` names.
+    const pluginMarker = typeof headers["x-bili-plugin"] === "string";
+    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "agent-session-id", "x-opencode-session-id", "x-session-affinity", "x-acp-session", "x-conversation-id", "x-session-id", "x-opencode-session", "session-id", "session_id"];
+    for (const name of names) {
+        if (name === "x-bili-plugin-conversation" && !pluginMarker) continue;
+        const v = headers[name];
+        if (typeof v === "string" && v.trim().length > 0) return { name, value: v.trim() };
+    }
+    return undefined;
+}
+
+/** Memory workers replay the parent history but keep their tool tail private. */
+export function zcodeMemoryConversation(parent: string, headers: Record<string, string | string[] | undefined>): string | undefined {
+    if (headers["x-zcode-query-source"] !== "project_memory_extract"
+        || headers["x-zcode-session-type"] !== "other"
+        || headers["x-session-id"] !== parent) return undefined;
+    const query = headers["x-query-id"];
+    if (typeof query !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(query)) return undefined;
+    // |sub: descendants can take over host-stamped management calls; workers cannot.
+    return `${parent}|aux:zcode-memory:${query}`;
+}
+
+/** #1106/#1102: whether the Responses-wire instructions fingerprint should
+ *  participate in the compression-session key at all. Inverted allowlist: the
+ *  fingerprint is OFF by default and applies ONLY to signals with a verified
+ *  id-sharing persona problem.
+ *
+ * subagentNamespace's instructions fingerprint exists to separate PERSONAS that
+ *  share one conversation id. Exactly two defendants ever needed it:
+ *  - codex (#150): task-level session ids are REUSED across tasks, so
+ *    different task instructions under one id must not merge. Modern codex
+ *    (>=0.147) already isolates subagent threads via x-codex-turn-metadata ->
+ *    thread-id verbatim (server.ts keys those directly, bypassing this
+ *    predicate); the fingerprint still matters for root threads and older
+ *    codex builds, detected by the turn-metadata header or the user agent
+ *    (same convention as isCodexClient, #645).
+ *  - claude code (#970/#4352): subagents SHARE the main agent's session id
+ *    on every wire (the anthropic path also separates them via the order
+ *    resolver when its two-signal header gate misses — see
+ *    claudeAnthropicPersonaOrderApplies below; the responses wire relies on
+ *    this fingerprint alone).
+ *
+ * Everyone else keys VERBATIM: instructions drift mid-id means "same
+ * conversation, evolved system context" (software upgrade, plugin install,
+ * AGENTS.md edit - the relay-station majority case, #1106), and forking there
+ * resets all compression state for no defending bug. opencode (persona-scoped
+ * ses_ ids, #1102/#1104), grok/mcode (per-session ids by their own source),
+ * plugin conversation ids, and generic x-session-id / body session_id all
+ * stay on the verbatim path now. The x-bili-plugin-instructions-mutable
+ * declaration (#1104) is vestigial: exempt is the default; hosts keep
+ * stamping it for protocol compatibility with older proxies.
+ *
+ * A future client that shares one id across personas and separates them ONLY
+ * by instructions must be added here (same evidence-per-client discipline as
+ * #1104, inverted).
+ */
+/** Name-free wire observations for the lane-decisions client registry
+ * (#3482): present header names, the resolved conversation-source header,
+ * and the codex user-agent fact. Shared by every predicate below so the
+ * signal extraction stays single-sourced. */
+function wireClientSignals(headers: Record<string, string | string[] | undefined>, personaSplitOff?: boolean): { headerNames: Set<string>; conversationSourceName: string | undefined; codexUserAgent: boolean; personaSplitOff?: boolean } {
+    const headerNames = new Set<string>();
+    for (const [name, value] of Object.entries(headers ?? {})) {
+        const first = Array.isArray(value) ? value[0] : value;
+        if (typeof first === "string" && first.trim().length > 0) headerNames.add(name);
+    }
+    return {
+        headerNames,
+        conversationSourceName: conversationHeaderSource(headers)?.name,
+        codexUserAgent: isCodexClient(headers),
+        personaSplitOff,
+    };
+}
+
+export function instructionsFingerprintApplies(headers: Record<string, string | string[] | undefined>, personaSplitOff?: boolean): boolean {
+    // Detection only — the client-identity DECISION (who keys by
+    // instructions) lives in the lane-decisions wire-client registry
+    // (#3482 site 4): the header-name literals are registry data, not
+    // scattered comparisons. Signals are name-free observations here.
+    // personaSplitOff (#5456): host-level opt-out threaded from ProxyOptions
+    // so resolveWireClientProfile can strip instructionsFingerprintKeyed
+    // without mutating WIRE_CLIENTS literals.
+    return resolveWireClientProfile(wireClientSignals(headers, personaSplitOff)).instructionsFingerprintKeyed;
+}
+
+/** #4352: whether THIS request's claude-code-over-Anthropic traffic should
+ * ride the continuity-aware order resolver (personaConversationOrder) for
+ * persona separation when the #970 two-signal header gate
+ * (claudeSubagentAgentId) misses.
+ *
+ * Evidence (v0.1.204 field report, #4352): Claude Code stamps ONE session id
+ * on every model request of a session INCLUDING Task-tool subagents, and the
+ * VS Code extension build's subagent requests carry no agent-id headers at
+ * all — so claudeSubagentAgentId misses and those subagents ride the raw
+ * parent id, where their disjoint short histories accumulate fold-reconcile
+ * drop events until epoch confirmation fires substrate-destruction and the
+ * parent's refs go permanently DEAD (compress rejected for the rest of the
+ * session). Routing such traffic through the order resolver separates exactly
+ * those disjoint rides onto |sub:<fp> lanes while a continuing main
+ * conversation keeps the raw key on order+content evidence (#2944) — the same
+ * mechanism the dsh lane uses (#1916).
+ *
+ * Detection only — the client-identity DECISION lives in the lane-decisions
+ * wire-client registry (#3482 site 4), same shape as
+ * instructionsFingerprintApplies above. */
+export function claudeAnthropicPersonaOrderApplies(headers: Record<string, string | string[] | undefined>): boolean {
+    return resolveWireClientProfile(wireClientSignals(headers)).personaOrderKeyed;
+}
+
+/** #5095 (D1-C): extract the bili SubagentStart lane token from an Anthropic
+ *  request's messages. The hook injects the token into the dispatch's FIRST
+ *  user message, so the scan stops at the first user message — a marker
+ *  pasted by the user into a LATER message must never fork the main
+ *  conversation off its raw key. Content shapes: bare string, or a block
+ *  array where only `type:"text"` blocks are scanned (the hook context may
+ *  sit inside a <system-reminder> wrapper; the marker is matched as a
+ *  substring, so the wrapper shape does not matter). Returns undefined when
+ *  absent — the overwhelmingly common case (main turns, other hosts,
+ *  un-upgraded installs) keeps resolution byte-identical to before. */
+export function claudeSubagentLaneTokenOf(messages: unknown): string | undefined {
+    if (!Array.isArray(messages)) return undefined;
+    for (const msg of messages) {
+        if (msg === null || typeof msg !== "object") continue;
+        const m = msg as { role?: unknown; content?: unknown };
+        if (m.role !== "user") continue;
+        if (typeof m.content === "string") return claudeLaneTokenIn(m.content);
+        if (Array.isArray(m.content)) {
+            for (const block of m.content) {
+                if (block === null || typeof block !== "object") continue;
+                const b = block as { type?: unknown; text?: unknown };
+                if (b.type === "text" && typeof b.text === "string") {
+                    const tok = claudeLaneTokenIn(b.text);
+                    if (tok !== undefined) return tok;
+                }
+            }
+        }
+        return undefined;
+    }
+    return undefined;
+}
+
+/** #1916/#1307/#1314: whether the persona fingerprint (session id + system
+ *  hash, "hash 不一样自动分裂") should participate in the compression-session
+ *  key for THIS request. Allowlist by plugin agent, evidence-per-client — the
+ *  same discipline as instructionsFingerprintApplies (#1104/#1107 inverted
+ *  allowlist), applied to the openai/anthropic/responses lanes where the
+ *  agent rides (#2203: dsh-over-Responses shares the same id-reuse shape;
+ *  `instructions` is that wire's system carrier).
+ *
+ *  dsh is the first entry: it stamps ONE x-bili-plugin-conversation id on
+ *  every model request of a session — including the auto-review
+ *  classifyRisk() calls (Auto permission tier fires one before EVERY tool
+ *  call; fixed REVIEW_POLICY system + a freshly-flattened single-user-blob
+ *  view, #1314 field report). Those review requests used to walk the full
+ *  pipeline under the MAIN conversation id: they overwrote the usage
+ *  baseline (#1916), evicted remembered snapshots (#1307 guard was a partial
+ *  stopgap), and fed orphan-GC — while the review blob is synthesized fresh
+ *  every time, so compressing it has zero reuse value. Keying dsh traffic by
+ *  id + system hash splits the review persona onto its own `|sub:<fp>`
+ *  session (kernel subagentNamespace anchor semantics: the first system
+ *  seen under the id keeps the raw key) so the main conversation's
+ *  compression state, baseline, and tool routing stay untouched, while
+ *  successive review calls still share ONE forked session.
+ *
+ *  Safety of hashing the system: dsh composes its main system ONCE per
+ *  session (event-sourced `system/message` — sections are config-derived;
+ *  the volatile time-context rides a USER message, not the system), so main
+ *  turns hash stably and never fork mid-conversation. A mid-session system
+ *  change (AGENTS.md edit, permission-preset switch, dsh upgrade) forks ONCE
+ *  — same class as a resume re-pay, and semantically right: a different
+ *  operating context IS a different persona. When the change is a plain
+ *  model/provider switch whose history keeps continuing the raw key's chain
+ *  (byte-exact, or re-serialization-churn-equal per the #2601 normalized
+ *  tail fingerprint in prefix-affinity), the anchor MIGRATES instead of
+ *  forking — and a fork that still legitimately happens is followed by the
+ *  host-stamped management-call routing (#2601 lineage follow in plugin.ts),
+ *  so compression state never strands on a stale parent. Proxy restart
+ *  resets the kernel's in-memory anchor; the persona that arrives first
+ *  claims the raw key (normally the main turn — review only fires alongside
+ *  tool calls).
+ *
+ *  Future hosts that reuse one session id across personas must be ADDED HERE
+ *  with traffic evidence (see AGENTS.md §2 Key Design Decisions), never
+ *  enabled wholesale — #1106: for everyone else, system drift mid-id means
+ *  "same conversation, evolved", and forking there resets compression for
+ *  no defending bug. */
+export function dshPersonaFingerprintApplies(headers: Record<string, string | string[] | undefined>): boolean {
+    const agent = headers["x-bili-plugin"];
+    return typeof agent === "string" && agent.trim() === "dsh";
+}
+
+/** Persona text for the openai chat wire: the concatenation of every
+ *  system-role message's text (string content or text parts). Empty string
+ *  when the request carries no system message — subagentNamespace treats
+ *  that as non-anchoring (verbatim key, no anchor claim), so system-less
+ *  auxiliary calls keep riding the main session. */
+export function openaiSystemTextForPersona(body: { messages?: unknown }): string {
+    const msgs = Array.isArray(body.messages) ? body.messages : [];
+    const texts: string[] = [];
+    for (const m of msgs) {
+        if (m === null || typeof m !== "object" || (m as { role?: unknown }).role !== "system") continue;
+        const content = (m as { content?: unknown }).content;
+        if (typeof content === "string") {
+            if (content.length > 0) texts.push(content);
+        } else if (Array.isArray(content)) {
+            for (const part of content) {
+                if (part !== null && typeof part === "object" && typeof (part as { text?: unknown }).text === "string") {
+                    const t = (part as { text: string }).text;
+                    if (t.length > 0) texts.push(t);
+                }
+            }
+        }
+    }
+    return texts.join("\n\n");
+}
+
+/** #5095 D1-B: per-run discriminator for the claude-anthropic derived-persona
+ *  lane key. Same-type subagents re-dispatched under one parent id carry a
+ *  byte-identical system (the persona tag), so the dispatch task prompt —
+ *  the first user message with extractable text — is what tells runs apart;
+ *  it is unique per run and stable for the agent's whole lifetime. Users
+ *  whose content holds no top-level text (pure tool_result) are skipped. ""
+ *  when nothing is usable → the call site degrades to the two-segment lane
+ *  key. Body-only read: no header literals here (B-class guard). */
+export function anthropicFirstUserFrag(messages: unknown): string {
+    const list = Array.isArray(messages) ? messages : [];
+    const cap = 1024;
+    for (const m of list) {
+        if (m === null || typeof m !== "object" || (m as { role?: unknown }).role !== "user") continue;
+        const content = (m as { content?: unknown }).content;
+        if (typeof content === "string") {
+            if (content.length > 0) return content.slice(0, cap);
+        } else if (Array.isArray(content)) {
+            const parts: string[] = [];
+            for (const part of content) {
+                if (part !== null && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string") {
+                    parts.push((part as { text: string }).text);
+                }
+            }
+            const joined = parts.join("\n\n");
+            if (joined.length > 0) return joined.slice(0, cap);
+        }
+    }
+    return "";
+}
+
+/**
+ * Return only an identity the client already supplied. Generated identities
+ * remain proxy-internal so billion-context does not invent upstream headers.
+ */
+export function affinityToken(identity: ConversationIdentity): string | undefined {
+    return identity.clientProvided ? identity.value : undefined;
+}
+
+/**
+ * #2218/#2645: decide what to do with `prompt_cache_key` on an outbound
+ * OpenAI chat body.
+ *
+ * "stamp" — the proxy writes its own conversation id into the field. Only the
+ * internal plugin lane qualifies (the winning conversation header is the
+ * bili-internal x-bili-plugin-conversation one — body-keyed relays such as
+ * the workbuddy panel read the body only and would otherwise fall to a
+ * content digest) and the client sent no key of its own (client value wins).
+ *
+ * #2645 probe-and-remember (replaces the old destination-shape gate): under
+ * `routing` auto/enabled, stamping applies to every destination shape —
+ * loopback pools, docker/LAN/VPS pools, plain remote relays alike all keep
+ * their affinity signal (the static loopback/rewritten-route heuristics hurt
+ * the two big pool populations while trying to protect strict direct APIs).
+ * The protection comes from the egress A/B seam (src/server/relay.ts +
+ * src/pck-probe.ts): when an egress carrying the key 400s, the identical
+ * request is re-sent once without it — accepted ⇒ causation confirmed and this
+ * exact origin+model pair stops being stamped for the process lifetime
+ * (in-memory, restart resets, surfaced via log/acp_status/web panel); still
+ * failing ⇒ inconclusive, nothing learned. Client-supplied keys pass through
+ * verbatim UNTIL their pair is A/B-ablated, after which they are withheld too
+ * (otherwise every turn re-paid the 400 round trip); that withholding is
+ * likewise in-memory and visible on the same surfaces. The A/B seam works in
+ * EVERY routing mode, including disabled (it still guards client keys).
+ *
+ * #5079 routing switch: `routing === "disabled"` (the default) never stamps —
+ * bili writes no prompt_cache_key of its own at all. A key echoing the
+ * conversation id back on the plugin lane (`sessionId`) is bili's own prior
+ * emission (dsh PI_CACHE_RETENTION / the omp/dsh extension stamp), not a
+ * client value, so it is dropped too; any other client value stays
+ * client-owned and passes through even under disabled.
+ */
+type RelayAffinityPckDecision = "stamp" | "keep-client" | "drop";
+
+export function resolveRelayAffinityPck(
+    identityHeaderName: string | undefined,
+    clientPck: unknown,
+    egressUrl: string | undefined,
+    upstreamOrigin: string,
+    routing: PromptCacheRouting,
+    sessionId?: string,
+    modelId?: unknown,
+): RelayAffinityPckDecision {
+    const ablated = pckKeyAbated(egressUrl, upstreamOrigin, modelId);
+    const internalLane = identityHeaderName === "x-bili-plugin-conversation";
+    const raw = typeof clientPck === "string" ? clientPck.trim() : "";
+    // #5079: the plugin lane's identity always derives from the bili-internal
+    // header (pck promotion only fires without one), so a body key equal to
+    // the session id here can only be bili's own machinery echoing back.
+    const biliOwned = internalLane && raw.length > 0 && sessionId !== undefined && raw === sessionId;
+    if (clientPck !== undefined && !biliOwned) return ablated ? "drop" : "keep-client";
+    if (ablated || !internalLane) return "drop";
+    if (routing === "disabled") return "drop";
+    return "stamp";
+}
+
+/**
+ * Promote a Responses body's `prompt_cache_key` over a content-fingerprint
+ * identity. Clients that replay full history statelessly (omp, some codex
+ * builds) send NO conversation headers and NO previous_response_id, so the
+ * kernel's identity chain falls to a hash of the ENTIRE input array — which
+ * changes every turn as the conversation grows, minting a brand-new session
+ * per request. Consequences: compression state never accumulates (the nudge
+ * sees tokenCount=0 at evaluation time, so a 90%-full context is never
+ * compressed) and the upstream affinity token churns every turn.
+ *
+ * `prompt_cache_key` is exactly the missing signal: it is the client's own
+ * stable per-conversation id (the OpenAI Responses cache-routing field).
+ * It only replaces the fingerprint — real conversation headers, body
+ * session_ids, and previous_response_id all stay stronger, so this can never
+ * override an identity the client stated more explicitly.
+ */
+export function preferPromptCacheKeyIdentity<T extends ConversationIdentity>(
+    identity: T | undefined,
+    body: { prompt_cache_key?: unknown },
+): T | undefined {
+    if (!identity || identity.source !== "content-fingerprint") return identity;
+    const pck = typeof body.prompt_cache_key === "string" ? body.prompt_cache_key.trim() : "";
+    if (pck.length === 0) return identity;
+    return { ...identity, value: pck, source: "prompt-cache-key", clientProvided: true };
+}
+
+/**
+ * Codex turn-metadata partitioning (#316 / PR-A).
+ *
+ * Codex (>=0.147) sends `x-codex-turn-metadata` (JSON) on every Responses
+ * request carrying `thread_source` ("user" for the root thread, "subagent"
+ * for spawned agent threads) and `thread_id`. Subagent threads REUSE the
+ * root's `session-id` header, so the legacy identity chain maps every thread
+ * of one task onto a single session — subagents inherit the root's
+ * compression state, which breaks #150's isolation (a guardian subagent must
+ * read the user's original authorization verbatim, never a compressed
+ * summary).
+ *
+ * When the metadata is present AND cross-checked (metadata.thread_id ===
+ * `thread-id` header), partition by thread_source:
+ *   - "user"     → undefined (validated, but the id resolves through the
+ *                  legacy precedence chain — binding the session-id header
+ *                  directly would leapfrog stronger headers such as
+ *                  x-bili-plugin-conversation and flip the identity when a
+ *                  wrapper adds/drops the metadata mid-session; the legacy
+ *                  chain reads the same session-id header for plain codex
+ *                  traffic, so the root value is unchanged)
+ *   - anything else → the `thread-id` header (fresh independent state per
+ *                  thread; self-contained replay is lossless). codex's
+ *                  ThreadSource serializes more than user/subagent —
+ *                  "guardian_review" (review sessions), "memory_consolidation",
+ *                  and arbitrary Feature strings such as "guardian_classifier"
+ *                  (guardian-v2 async scorer) — all of which are internal
+ *                  threads that need #150 isolation just as much, so the
+ *                  discrimination is inverted: only "user" joins the root
+ *                  session, every other source gets its own thread state.
+ * A non-string/empty thread_source, unparseable JSON, or missing/mismatched
+ * thread_id → undefined: the caller falls through to the legacy chain
+ * unchanged.
+ */
+type CodexTurnIdentity = {
+    value: string;
+    threadSource: string;
+};
+
+export function codexTurnIdentity(headers: Record<string, string | string[] | undefined>): CodexTurnIdentity | undefined {
+    const raw = headers["x-codex-turn-metadata"];
+    if (typeof raw !== "string" || raw.trim().length === 0) return undefined;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(raw);
+    } catch {
+        return undefined;
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    const record = parsed as Record<string, unknown>;
+    const threadSource = record["thread_source"];
+    if (typeof threadSource !== "string" || threadSource.trim().length === 0) return undefined;
+    const metaThreadId = record["thread_id"];
+    if (typeof metaThreadId !== "string" || metaThreadId.trim().length === 0) return undefined;
+    const threadHeader = headers["thread-id"];
+    if (typeof threadHeader !== "string" || threadHeader.trim() !== metaThreadId.trim()) return undefined;
+    if (threadSource.trim() === "user") {
+        // A root turn's headers are validated (the pair cross-checks), but the
+        // session id still resolves through the legacy precedence chain:
+        // binding directly to the session-id header here would leapfrog
+        // stronger headers (e.g. x-bili-plugin-conversation) and flip the
+        // identity when a wrapper adds or drops the metadata mid-session. The
+        // legacy chain reads the same session-id header for plain codex
+        // traffic, so the root value is unchanged.
+        return undefined;
+    }
+    return { value: threadHeader.trim(), threadSource };
+}
+
+/**
+ * Claude Code subagent split (#970).
+ *
+ * Claude Code stamps the SAME `x-claude-code-session-id` on every model
+ * request of a session — including requests made by Task-tool subagents —
+ * so the identity chain maps main turn and all subagents onto ONE session.
+ * Every request then serializes on that session's lock (withSessionLock
+ * covers prepare + forward + the streamed response), and a slow subagent
+ * first request head-of-line-blocks the main turn (and vice versa) for the
+ * full upstream latency.
+ *
+ * Discrimination is two-signal, both verified against live Claude Code
+ * 2.1.274 traffic (`-p` mode AND custom agent types like Explore):
+ *
+ * 1. HEADER: the request carries `x-claude-code-agent-id` and/or
+ *    `x-claude-code-parent-agent-id`. Main-turn requests carry agent-id only
+ *    from their second request on (the very first request and side requests
+ *    like title generation carry neither), so the header alone can't decide —
+ *    the parent header is NOT reliable (general-purpose `-p` subagents send
+ *    it, custom agent types like Explore do not).
+ *
+ * 2. SYSTEM: the MAIN agent's system always contains a block starting with
+ *    one of the MAIN_SYSTEM_PREFIXES ("You are Claude Code…" for interactive
+ *    sessions, "You are an interactive agent…" for -p/SDK sessions), while a
+ *    subagent's system blocks are its agent definition ("This session is a
+ *    background job…", "You are a file search specialist for…", …) — no
+ *    stable positive marker exists across agent types, so the check is
+ *    negative: none of the main prefixes may match.
+ *
+ * A request splits only when BOTH signals say subagent (header present AND
+ * no main prefix in system). Failure modes degrade in the safe direction:
+ * if a future Claude Code rewords its main prompts, subagents stop being
+ * split (back to today's serial behavior) — the main session can never be
+ * mis-split, because its prefixes are the gate and its system legitimately
+ * mutates turn to turn without ever losing the prefix block.
+ *
+ * Split sessions keep per-subagent compression state (a subagent is its own
+ * conversation; isolation matches the codex #316/#150 semantics) and get
+ * their own lock chain, so subagents stop queueing behind the main turn.
+ * The namespace format mirrors subagentNamespace's `<id>|sub:<hash>` on the
+ * Responses branch. Clients without these headers (older Claude Code, other
+ * agents, curl) are untouched.
+ */
+const MAIN_SYSTEM_PREFIXES = ["You are Claude Code", "You are an interactive agent"] as const;
+
+export function claudeSubagentAgentId(
+    headers: Record<string, string | string[] | undefined>,
+    systemBlocks: string[],
+): string | undefined {
+    // Node lowercases inbound header names; an array value (repeated header)
+    // is ambiguous and treated as absent, same posture as
+    // clientConversationHeader.
+    const agent = headers["x-claude-code-agent-id"];
+    const parent = headers["x-claude-code-parent-agent-id"];
+    const agentId = typeof agent === "string" && agent.trim().length > 0 ? agent.trim() : undefined;
+    const parentId = typeof parent === "string" && parent.trim().length > 0 ? parent.trim() : undefined;
+    if (agentId === undefined && parentId === undefined) return undefined;
+    const isMain = systemBlocks.some((block) => {
+        const t = block.trimStart();
+        return MAIN_SYSTEM_PREFIXES.some((p) => t.startsWith(p));
+    });
+    if (isMain) return undefined;
+    return agentId ?? parentId;
+}
+
+/** Derive the subagent session id `<id>|sub:<agent-id>`; unchanged when the
+ *  request is not a Claude Code subagent (no agent header, or main-turn
+ *  system prefixes present). */
+export function claudeSubagentSplit(id: string, headers: Record<string, string | string[] | undefined>, systemBlocks: string[]): string {
+    const agent = claudeSubagentAgentId(headers, systemBlocks);
+    return agent ? `${id}|sub:${agent}` : id;
+}

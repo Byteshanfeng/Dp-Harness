@@ -51,6 +51,38 @@ function makeManager(
 }
 
 describe('SessionManager instances', () => {
+  it('restores a persisted Session row after its resident instance is removed', async ({ mock, remote }) => {
+    const manager = makeManager(mock, remote)
+    onTestFinished(() => manager.dispose())
+    remote.session.list.mockResolvedValue(ok({ items: [summary(S1, { cwd: '/project' })] }))
+    await manager.refreshList()
+
+    manager.handleSessionRemoved(S1)
+    expect(manager.getListSnapshot().items).toEqual([])
+    await vi.waitFor(() => {
+      expect(manager.getListSnapshot().items[0]).toMatchObject({ sessionId: S1, cwd: '/project' })
+    })
+  })
+
+  it('rechecks storage after a removal races an older list response', async ({ mock, remote }) => {
+    const manager = makeManager(mock, remote)
+    onTestFinished(() => manager.dispose())
+    remote.session.list.mockResolvedValueOnce(ok({ items: [summary(S1, { cwd: '/project' })] }))
+    await manager.refreshList()
+    const older = Promise.withResolvers<Awaited<ReturnType<typeof remote.session.list>>>()
+    remote.session.list.mockReturnValueOnce(older.promise)
+    remote.session.list.mockResolvedValueOnce(ok({ items: [summary(S1, { cwd: '/project' })] }))
+
+    const refreshing = manager.refreshList()
+    manager.handleSessionRemoved(S1)
+    older.resolve(ok({ items: [summary(S1, { cwd: '/project' })] }))
+    await refreshing
+    await vi.waitFor(() => {
+      expect(remote.session.list).toHaveBeenCalledTimes(3)
+      expect(manager.getListSnapshot().items[0]?.sessionId).toBe(S1)
+    })
+  })
+
   it.for(['event', 'list'] as const)(
     'forgets running when an unretained identity disappears through a %s',
     async (source, { mock, remote }) => {

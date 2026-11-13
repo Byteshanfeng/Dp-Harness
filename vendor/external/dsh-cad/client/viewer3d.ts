@@ -1,0 +1,809 @@
+/**
+ * 3D viewport: a self-contained Three.js scene mounted into a container
+ * element. Owns renderer/camera/lights/controls lifecycle and disposal.
+ *
+ * CAD convention: Z-up world (matching OCCT and the modeling document), with
+ * a labeled XYZ axis triad always visible — including the empty scene.
+ */
+import * as THREE from 'three'
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+import { decodeF32, decodeU32 } from './decode.js'
+import { ViewCube } from './viewcube.js'
+import { PickingController } from './picking.js'
+import { demoBracketGeometry, DEMO_BOUNDS } from './demo-model.js'
+import type { CadScene3D, CadMesh } from './scene-types.js'
+import { cadScenePalette, getCadTheme, subscribeCadTheme } from './theme.js'
+import type { CadScenePalette } from './theme.js'
+
+/** CAD render modes: shaded faces with feature edges (default), faces only,
+ *  or full wireframe. */
+export type RenderMode = 'shaded-edges' | 'shaded' | 'wireframe'
+
+/** Feature-edge threshold in degrees — below it, smooth surfaces stay clean. */
+const EDGE_ANGLE = 25
+
+/** The built-in demo examples served by /dsh-cad/demo-scene. */
+export type DemoPart = 'bracket' | 'flange' | 'shaft'
+
+export interface Viewer3DHandle {
+  /** Legacy shortcut: true → wireframe, false → shaded-edges. */
+  setWireframe(enabled: boolean): void
+  setRenderMode(mode: RenderMode): void
+  resetView(): void
+  dispose(): void
+}
+
+/** A displayable 3D scene: JSON form (base64 attributes) or decoded binary. */
+export type ViewerScene3D = CadScene3D | {
+  kind: '3d'
+  format: string
+  meshes: Array<Record<string, unknown>>
+  bounds: { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } }
+  units: string
+}
+
+export interface LiveViewer3DHandle extends Viewer3DHandle {
+  /**
+   * Swap the displayed geometry in place: renderer, camera and controls
+   * survive, the user's viewpoint is preserved (depth planes re-fitted).
+   */
+  setScene(scene: ViewerScene3D): void
+  /**
+   * Emissive-highlight the mesh with this name (the assembly tree's part
+   * selection); null clears. Survives scene swaps — re-applied to new meshes.
+   */
+  highlightMesh(name: string | null): void
+  /**
+   * Hide/show top-level meshes by name (the assembly tree's eye toggles).
+   * Survives scene swaps — re-applied to new meshes.
+   */
+  setHiddenMeshes(names: Iterable<string>): void
+  /** The main WebGL canvas — for context-loss monitoring. */
+  readonly domElement: HTMLCanvasElement
+}
+
+export interface CadEditorHandle extends Viewer3DHandle {
+  /** Load a different built-in demo BRep part (keeps the current one on failure). */
+  loadPart(part: DemoPart): void
+}
+
+/** Colors that follow the host theme; tagged on materials so a theme flip can
+ *  recolor the live scene without rebuilding geometry. */
+type CadColorRole = 'mesh' | 'edge' | 'sketch-fill' | 'sketch-wire' | 'sketch-point'
+
+/** The Three.js palette for a theme. */
+function palette(dark: boolean): CadScenePalette {
+  return cadScenePalette(dark ? 'dark' : 'light')
+}
+
+/** Recolor the theme-following materials under root (theme flip, in place). */
+function applyThemeColors(root: THREE.Object3D, dark: boolean): void {
+  const colors = palette(dark)
+  root.traverse((child) => {
+    const role = child.userData.cadColorRole as CadColorRole | undefined
+    if (role === undefined) return
+    switch (role) {
+      case 'mesh':
+        ((child as THREE.Mesh).material as THREE.MeshStandardMaterial).color.setHex(colors.mesh)
+        break
+      case 'sketch-fill':
+        ((child as THREE.Mesh).material as THREE.MeshBasicMaterial).color.setHex(colors.sketchFill)
+        break
+      case 'edge':
+        ((child as THREE.LineSegments).material as THREE.LineBasicMaterial).color.setHex(colors.edge)
+        break
+      case 'sketch-wire':
+        ((child as THREE.LineSegments).material as THREE.LineBasicMaterial).color.setHex(colors.sketchWire)
+        break
+      case 'sketch-point':
+        ((child as THREE.Points).material as THREE.PointsMaterial).color.setHex(colors.sketchPoint)
+        break
+    }
+  })
+}
+
+/** A canvas-texture sprite with the axis letter at the triad tip. */
+function axisLabelSprite(text: string, color: number): THREE.Sprite {
+  const canvas = document.createElement('canvas')
+  canvas.width = 64
+  canvas.height = 64
+  const context = canvas.getContext('2d')
+  if (context !== null) {
+    context.font = 'bold 44px -apple-system, "Segoe UI", sans-serif'
+    context.textAlign = 'center'
+    context.textBaseline = 'middle'
+    context.fillStyle = `#${color.toString(16).padStart(6, '0')}`
+    context.fillText(text, 32, 34)
+  }
+  const texture = new THREE.CanvasTexture(canvas)
+  texture.needsUpdate = true
+  const material = new THREE.SpriteMaterial({ map: texture, transparent: true })
+  const sprite = new THREE.Sprite(material)
+  sprite.scale.set(1, 1, 1)
+  return sprite
+}
+
+interface SceneCommon {
+  renderer: THREE.WebGLRenderer
+  camera: THREE.PerspectiveCamera
+  controls: OrbitControls
+  dispose(): void
+}
+
+/** Shared scene shell: renderer, Z-up camera, orbit controls, resize, loop. */
+function mountShell(container: HTMLElement, options: { autoRotate?: boolean; onResize?: (width: number, height: number) => void } = {}): SceneCommon {
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true })
+  renderer.setPixelRatio(window.devicePixelRatio)
+  renderer.setSize(container.clientWidth || 360, container.clientHeight || 300)
+  container.appendChild(renderer.domElement)
+  renderer.domElement.style.width = '100%'
+  renderer.domElement.style.height = '100%'
+  renderer.domElement.style.display = 'block'
+
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 10_000)
+  camera.up.set(0, 0, 1) // CAD convention: Z-up
+
+  const controls = new OrbitControls(camera, renderer.domElement)
+  controls.enableDamping = true
+  controls.dampingFactor = 0.12
+  if (options.autoRotate === true) {
+    controls.autoRotate = true
+    controls.autoRotateSpeed = 0.8
+  }
+
+  const resize = (): void => {
+    const width = container.clientWidth
+    const height = container.clientHeight
+    if (width === 0 || height === 0) return
+    renderer.setSize(width, height, false)
+    camera.aspect = width / height
+    camera.updateProjectionMatrix()
+    options.onResize?.(width, height)
+  }
+  const observer = new ResizeObserver(resize)
+  observer.observe(container)
+
+  return {
+    renderer,
+    camera,
+    controls,
+    dispose(): void {
+      observer.disconnect()
+      controls.dispose()
+      renderer.dispose()
+      if (renderer.domElement.parentNode === container) container.removeChild(renderer.domElement)
+    },
+  }
+}
+
+/** The always-on CAD scene furniture: ground grid (XY) + labeled XYZ triad.
+ *  Colors come from the host theme (`dark`), so the furniture stays readable on
+ *  both slabs; the triad keeps the X-red / Y-green / Z-blue convention. */
+function addSceneFurniture(scene: THREE.Scene, scale: number, dark: boolean): THREE.Object3D[] {
+  const colors = palette(dark)
+  const group = new THREE.Group()
+
+  const grid = new THREE.GridHelper(scale * 2, 20, colors.gridCenter, colors.gridLine)
+  // GridHelper defaults to the XZ plane; rotate onto XY for the Z-up world.
+  grid.rotation.x = Math.PI / 2
+  group.add(grid)
+
+  const axes = new THREE.AxesHelper(scale)
+  axes.setColors(colors.axisX, colors.axisY, colors.axisZ)
+  group.add(axes)
+
+  const labelOffset = scale * 1.12
+  const labelScale = scale * 0.14
+  const xAxis = axisLabelSprite('X', colors.axisX)
+  xAxis.position.set(labelOffset, 0, 0)
+  xAxis.scale.set(labelScale, labelScale, labelScale)
+  group.add(xAxis)
+  const yAxis = axisLabelSprite('Y', colors.axisY)
+  yAxis.position.set(0, labelOffset, 0)
+  yAxis.scale.set(labelScale, labelScale, labelScale)
+  group.add(yAxis)
+  const zAxis = axisLabelSprite('Z', colors.axisZ)
+  zAxis.position.set(0, 0, labelOffset)
+  zAxis.scale.set(labelScale, labelScale, labelScale)
+  group.add(zAxis)
+
+  scene.add(group)
+  return [group, grid, axes, xAxis, yAxis, zAxis]
+}
+
+function disposeObjects(objects: THREE.Object3D[]): void {
+  for (const object of objects) {
+    object.traverse((child) => {
+      const mesh = child as THREE.Mesh
+      if (mesh.isMesh) {
+        mesh.geometry?.dispose()
+        const material = mesh.material
+        if (Array.isArray(material)) material.forEach((entry) => entry.dispose())
+        else material?.dispose()
+      }
+      const line = child as THREE.LineSegments
+      if (line.isLineSegments) {
+        line.geometry?.dispose()
+        line.material?.dispose()
+      }
+      const sprite = child as THREE.Sprite
+      if (sprite.isSprite) {
+        sprite.material.map?.dispose()
+        sprite.material.dispose()
+      }
+    })
+  }
+}
+
+// ── render modes (faces / feature edges / wireframe) ────────────────────────
+
+/** Lazily attach a feature-edge overlay to a mesh (computed once per mesh). */
+function ensureMeshEdges(mesh: THREE.Mesh, dark: boolean): THREE.LineSegments | undefined {
+  const existing = mesh.userData.edges
+  if (existing !== undefined) return existing
+  const geometry = mesh.geometry as THREE.BufferGeometry | undefined
+  if (geometry === undefined) return undefined
+  // Push faces slightly back so edge lines win the depth test.
+  const material = mesh.material as THREE.MeshStandardMaterial
+  material.polygonOffset = true
+  material.polygonOffsetFactor = 1
+  material.polygonOffsetUnits = 1
+  const edgeMaterial = new THREE.LineBasicMaterial({ color: palette(dark).edge, transparent: true, opacity: 0.9 })
+  const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geometry, EDGE_ANGLE), edgeMaterial)
+  edges.userData.cadColorRole = 'edge' satisfies CadColorRole
+  mesh.add(edges)
+  mesh.userData.edges = edges
+  return edges
+}
+
+/** Apply a render mode to every mesh under root. */
+function applyRenderMode(root: THREE.Object3D, mode: RenderMode, dark: boolean): void {
+  root.traverse((child) => {
+    const mesh = child as THREE.Mesh
+    if (!mesh.isMesh) return
+    const material = mesh.material as THREE.MeshStandardMaterial
+    material.wireframe = mode === 'wireframe'
+    const edges = mode === 'shaded-edges' ? ensureMeshEdges(mesh, dark) : (mesh.userData.edges as THREE.LineSegments | undefined)
+    if (edges !== undefined) edges.visible = mode === 'shaded-edges'
+  })
+}
+
+/** Build one Three.js mesh; positions/normals/indices may be base64 or
+ *  already-decoded typed arrays (the binary transport path), or a ready-made
+ *  geometry (the built-in demo part). */
+/** Round dot texture for sketch vertex points (PointsMaterial defaults to squares). */
+let circleDotTexture: THREE.Texture | null = null
+function circleDot(): THREE.Texture {
+  if (circleDotTexture !== null) return circleDotTexture
+  const canvas = document.createElement('canvas')
+  canvas.width = 32
+  canvas.height = 32
+  const ctx = canvas.getContext('2d')
+  if (ctx !== null) {
+    ctx.fillStyle = '#ffffff'
+    ctx.beginPath()
+    ctx.arc(16, 16, 14, 0, Math.PI * 2)
+    ctx.fill()
+  }
+  circleDotTexture = new THREE.CanvasTexture(canvas)
+  return circleDotTexture
+}
+
+function buildMesh(mesh: CadMesh | { name: string; color?: number; mode?: 'wire' | 'fill' | 'points'; positions: Float32Array; normals?: Float32Array; indices: Uint32Array } | { name: string; color?: number; geometry: THREE.BufferGeometry }, dark: boolean): THREE.Object3D {
+  const colors = palette(dark)
+  const decoded = 'mode' in mesh ? (mesh as { mode?: 'wire' | 'fill' | 'points' }).mode : undefined
+  if (decoded === 'wire') {
+    // Sketch display wire: the indices are a LINES list, not triangles.
+    const geometry = new THREE.BufferGeometry()
+    const positions = typeof (mesh as { positions: unknown }).positions === 'string' ? decodeF32((mesh as { positions: string }).positions) : (mesh as { positions: Float32Array }).positions
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+    const indices = typeof (mesh as { indices: unknown }).indices === 'string' ? decodeU32((mesh as { indices: string }).indices) : (mesh as { indices: Uint32Array }).indices
+    geometry.setIndex(new THREE.BufferAttribute(indices, 1))
+    const wireColor = (mesh as { color?: number }).color
+    const lines = new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({
+      color: wireColor ?? colors.sketchWire,
+      depthTest: false,
+      transparent: true,
+      opacity: 0.95,
+    }))
+    // Above the fill (1), below the dots/picking overlays (3).
+    lines.renderOrder = 2
+    lines.name = (mesh as { name?: string }).name ?? ''
+    if (wireColor === undefined) lines.userData.cadColorRole = 'sketch-wire' satisfies CadColorRole
+    return lines
+  }
+  if (decoded === 'fill') {
+    // Sketch enclosed region: a lighter, translucent double-sided face.
+    const geometry = new THREE.BufferGeometry()
+    const positions = (mesh as { positions: Float32Array }).positions
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+    geometry.setIndex(new THREE.BufferAttribute((mesh as { indices: Uint32Array }).indices, 1))
+    geometry.computeVertexNormals()
+    const fillColor = (mesh as { color?: number }).color
+    const region = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
+      color: fillColor ?? colors.sketchFill,
+      transparent: true,
+      opacity: 0.22,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    }))
+    region.renderOrder = 1
+    region.name = (mesh as { name?: string }).name ?? ''
+    if (fillColor === undefined) region.userData.cadColorRole = 'sketch-fill' satisfies CadColorRole
+    return region
+  }
+  if (decoded === 'points') {
+    // Sketch TRUE vertex dots: round (alpha-masked), screen-constant size.
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.BufferAttribute((mesh as { positions: Float32Array }).positions, 3))
+    const pointColor = (mesh as { color?: number }).color
+    const dots = new THREE.Points(geometry, new THREE.PointsMaterial({
+      color: pointColor ?? colors.sketchPoint,
+      map: circleDot(),
+      size: 8,
+      sizeAttenuation: false,
+      alphaTest: 0.5,
+      transparent: true,
+      depthTest: false,
+    }))
+    dots.renderOrder = 3
+    dots.name = (mesh as { name?: string }).name ?? ''
+    if (pointColor === undefined) dots.userData.cadColorRole = 'sketch-point' satisfies CadColorRole
+    return dots
+  }
+  const geometry = 'geometry' in mesh
+    ? mesh.geometry
+    : (() => {
+        const geometry = new THREE.BufferGeometry()
+        const positions = typeof (mesh as { positions: unknown }).positions === 'string' ? decodeF32((mesh as { positions: string }).positions) : (mesh as { positions: Float32Array }).positions
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+        if ((mesh as { normals?: unknown }).normals !== undefined) {
+          const normals = typeof (mesh as { normals?: unknown }).normals === 'string' ? decodeF32((mesh as { normals: string }).normals) : (mesh as { normals: Float32Array }).normals
+          geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3))
+        } else {
+          geometry.computeVertexNormals()
+        }
+        const indices = typeof (mesh as { indices: unknown }).indices === 'string' ? decodeU32((mesh as { indices: string }).indices) : (mesh as { indices: Uint32Array }).indices
+        geometry.setIndex(new THREE.BufferAttribute(indices, 1))
+        return geometry
+      })()
+  const explicitColor = (mesh as { color?: number }).color
+  const material = new THREE.MeshStandardMaterial({
+    color: explicitColor ?? colors.mesh,
+    metalness: 0.15,
+    roughness: 0.55,
+    flatShading: (mesh as { normals?: unknown }).normals === undefined,
+    side: THREE.DoubleSide,
+  })
+  const built = new THREE.Mesh(geometry, material)
+  // Named after the source mesh (body / assembly instance) — picking labels
+  // and the assembly-tree highlight both match on it.
+  built.name = (mesh as { name?: string }).name ?? ''
+  if (explicitColor === undefined) built.userData.cadColorRole = 'mesh' satisfies CadColorRole
+  return built
+}
+
+/**
+ * The CAD editor viewport. With `part` set, the demo example parsed from its
+ * packaged .brep (served by /dsh-cad/demo-scene) is loaded, the client-side
+ * extrusion acting as the instant-paint fallback. With `part: null` the editor
+ * starts empty — grid, axes and the ViewCube only, no geometry.
+ */
+export function mountCadEditor3D(container: HTMLElement, options: { onSource?: (source: 'brep' | 'fallback') => void; part?: DemoPart | null } = {}): CadEditorHandle {
+  // onResize re-frames until the user drives the camera — `interacted` and
+  // `placeCamera` are declared below, but the observer only fires after the
+  // synchronous mount body finished.
+  const shell = mountShell(container, {
+    onResize: (): void => {
+      if (!interacted) placeCamera()
+    },
+  })
+  const scene = new THREE.Scene()
+  let dark = getCadTheme() === 'dark'
+
+  // cadRoot is stable across the BRep swap: picking and render-mode helpers
+  // hold this reference, so replaced children are always the live set.
+  const empty = options.part === null
+  const cadRoot = new THREE.Group()
+  scene.add(cadRoot)
+  let cad = new THREE.Group()
+  if (!empty) cad.add(buildMesh({ name: 'demo-bracket', geometry: demoBracketGeometry() }, dark))
+  cadRoot.add(cad)
+
+  // Empty editors frame a neutral ~200 mm working area instead of the demo part.
+  const EMPTY_BOUNDS = { min: { x: -100, y: -100, z: 0 }, max: { x: 100, y: 100, z: 100 } }
+  let bounds: { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } } = empty ? EMPTY_BOUNDS : { ...DEMO_BOUNDS }
+  let size = new THREE.Vector3(
+    bounds.max.x - bounds.min.x,
+    bounds.max.y - bounds.min.y,
+    bounds.max.z - bounds.min.z,
+  )
+  let center = new THREE.Vector3(
+    (bounds.max.x + bounds.min.x) / 2,
+    (bounds.max.y + bounds.min.y) / 2,
+    (bounds.max.z + bounds.min.z) / 2,
+  )
+  let maxDim = Math.max(size.x, size.y, size.z, 1e-6)
+
+  scene.add(cad)
+
+  const hemisphere = new THREE.HemisphereLight(0xffffff, palette(dark).hemisphereGround, 1.1)
+  scene.add(hemisphere)
+  const key = new THREE.DirectionalLight(0xffffff, 1.6)
+  scene.add(key)
+  const fill = new THREE.DirectionalLight(0xffffff, 0.5)
+  scene.add(fill)
+  const placeLights = (): void => {
+    key.position.set(center.x + maxDim, center.y + maxDim * 1.4, center.z + maxDim * 0.8)
+    fill.position.set(center.x - maxDim, center.y + maxDim * 0.4, center.z - maxDim * 0.6)
+  }
+  placeLights()
+
+  // Grid/labels scale with the model and follow the theme: rebuilt in place on
+  // a frame change (BRep swap) and on a host theme flip.
+  let furniture: THREE.Object3D[] = []
+
+  let mode: RenderMode = 'shaded-edges'
+
+  const placeCamera = (): void => {
+    const distance = fitDistance(maxDim, shell.camera.aspect, shell.camera.fov)
+    shell.camera.position.set(
+      center.x + distance * 0.7,
+      center.y + distance * 0.55,
+      center.z + distance * 0.6,
+    )
+    shell.controls.target.copy(center)
+    shell.controls.update()
+  }
+
+  /** Rebuild the scale-dependent furniture in place (grid + labeled triad). */
+  const rebuildFurniture = (): void => {
+    if (furniture.length > 0) {
+      disposeObjects(furniture)
+      scene.remove(furniture[0])
+    }
+    furniture = addSceneFurniture(scene, maxDim, dark)
+    const nextGrid = furniture[1] as THREE.GridHelper
+    nextGrid.position.set(center.x, center.y, bounds.min.z)
+  }
+
+  const applyFrame = (): void => {
+    rebuildFurniture()
+    shell.camera.near = maxDim / 100
+    shell.camera.far = maxDim * 40
+    applyRenderMode(cadRoot, mode, dark)
+    placeLights()
+    placeCamera()
+  }
+  applyFrame()
+
+  // Re-fit while the layout settles (fill-mode containers resize after mount);
+  // once the user drives the camera themselves, resizes never re-frame.
+  let interacted = false
+  const markInteracted = (): void => {
+    interacted = true
+  }
+  shell.renderer.domElement.addEventListener('pointerdown', markInteracted, { passive: true })
+  shell.renderer.domElement.addEventListener('wheel', markInteracted, { passive: true })
+
+  const viewCube = new ViewCube({ container, camera: shell.camera, controls: shell.controls, onHome: placeCamera })
+  const picking = new PickingController({ domElement: shell.renderer.domElement, camera: shell.camera, cad: cadRoot })
+
+  // Follow a host theme flip: same geometry, new furniture/material palette —
+  // the camera is never re-framed (the user's viewpoint survives).
+  const unsubscribeTheme = subscribeCadTheme(() => {
+    const next = getCadTheme() === 'dark'
+    if (next === dark) return
+    dark = next
+    hemisphere.groundColor.setHex(palette(dark).hemisphereGround)
+    rebuildFurniture()
+    applyThemeColors(cadRoot, dark)
+  })
+
+  let disposed = false
+  /** Swap in geometry parsed from the real BRep file (server-side OCCT). */
+  const swapFromBrep = (loaded: { meshes: Array<Record<string, unknown>>; bounds: typeof bounds }): void => {
+    if (disposed) return
+    cadRoot.remove(cad)
+    disposeObjects([cad])
+    picking.invalidate()
+    cad = new THREE.Group()
+    for (const mesh of loaded.meshes) cad.add(buildMesh(mesh as never, dark))
+    cadRoot.add(cad)
+    bounds = loaded.bounds
+    size = new THREE.Vector3(
+      bounds.max.x - bounds.min.x,
+      bounds.max.y - bounds.min.y,
+      bounds.max.z - bounds.min.z,
+    )
+    center = new THREE.Vector3(
+      (bounds.max.x + bounds.min.x) / 2,
+      (bounds.max.y + bounds.min.y) / 2,
+      (bounds.max.z + bounds.min.z) / 2,
+    )
+    maxDim = Math.max(size.x, size.y, size.z, 1e-6)
+    applyFrame()
+  }
+
+  let brepLoaded = false
+  /** Load a demo part's BRep scene and swap it in (server-side OCCT parse). */
+  const loadPart = (part: DemoPart): void => {
+    fetch(`/dsh-cad/demo-scene?part=${part}`)
+      .then((response) => (response.ok ? (response.json() as Promise<{ meshes: Array<Record<string, unknown>>; bounds: typeof bounds }>) : Promise.reject(new Error(`HTTP ${response.status}`))))
+      .then((loaded) => {
+        if (disposed) return
+        swapFromBrep(loaded)
+        brepLoaded = true
+        options.onSource?.('brep')
+      })
+      .catch(() => {
+        /* keep whatever is currently displayed */
+        if (!disposed) options.onSource?.(brepLoaded ? 'brep' : 'fallback')
+      })
+  }
+  if (!empty) loadPart(options.part ?? 'bracket')
+
+  const frame = (): void => {
+    animationId = requestAnimationFrame(frame)
+    shell.controls.update()
+    shell.renderer.render(scene, shell.camera)
+    viewCube.update()
+  }
+  let animationId = requestAnimationFrame(frame)
+
+  return {
+    setWireframe(enabled: boolean): void {
+      this.setRenderMode(enabled ? 'wireframe' : 'shaded-edges')
+    },
+    setRenderMode(next: RenderMode): void {
+      mode = next
+      applyRenderMode(cadRoot, mode, dark)
+    },
+    loadPart,
+    resetView: placeCamera,
+    dispose(): void {
+      disposed = true
+      cancelAnimationFrame(animationId)
+      unsubscribeTheme()
+      picking.dispose()
+      viewCube.dispose()
+      disposeObjects([cadRoot, ...furniture, hemisphere, key, fill])
+      shell.dispose()
+    },
+  }
+}
+
+/**
+ * Camera distance that fits the model's max dimension through the smaller of
+ * the vertical/horizontal FOVs (a tall narrow viewport must fit horizontally,
+ * a wide chat card vertically), keeping the classic 3/4 viewing angle.
+ */
+function fitDistance(maxDim: number, aspect: number, fovDegrees: number): number {
+  const fovV = (fovDegrees * Math.PI) / 180
+  const fovH = 2 * Math.atan(Math.tan(fovV / 2) * (Number.isFinite(aspect) && aspect > 0 ? aspect : 1))
+  const fitFov = Math.min(fovV, fovH)
+  return ((maxDim / 2) / Math.tan(fitFov / 2)) * 1.5
+}
+
+/** Mount a 3D viewer for real geometry into container; returns the control handle. */
+export function mountViewer3D(container: HTMLElement, scene: ViewerScene3D): LiveViewer3DHandle {
+  // onResize re-frames until the user drives the camera — `interacted` and
+  // `placeCamera` are declared below, but the observer only fires after the
+  // synchronous mount body finished.
+  const shell = mountShell(container, {
+    onResize: (): void => {
+      if (!interacted) placeCamera()
+    },
+  })
+  const threeScene = new THREE.Scene()
+  let dark = getCadTheme() === 'dark'
+
+  // cadRoot is stable across scene swaps: picking and render-mode helpers hold
+  // this reference, so replaced children are always the live set.
+  const cadRoot = new THREE.Group()
+  threeScene.add(cadRoot)
+  let cad = new THREE.Group()
+  for (const mesh of scene.meshes) cad.add(buildMesh(mesh, dark))
+  cadRoot.add(cad)
+
+  let bounds = scene.bounds
+  let size = new THREE.Vector3(
+    bounds.max.x - bounds.min.x,
+    bounds.max.y - bounds.min.y,
+    bounds.max.z - bounds.min.z,
+  )
+  let center = new THREE.Vector3(
+    (bounds.max.x + bounds.min.x) / 2,
+    (bounds.max.y + bounds.min.y) / 2,
+    (bounds.max.z + bounds.min.z) / 2,
+  )
+  let maxDim = Math.max(size.x, size.y, size.z, 1e-6)
+
+  const hemisphere = new THREE.HemisphereLight(0xffffff, palette(dark).hemisphereGround, 1.1)
+  threeScene.add(hemisphere)
+  const key = new THREE.DirectionalLight(0xffffff, 1.6)
+  threeScene.add(key)
+  const fill = new THREE.DirectionalLight(0xffffff, 0.5)
+  threeScene.add(fill)
+  const placeLights = (): void => {
+    key.position.set(center.x + maxDim, center.y + maxDim * 1.4, center.z + maxDim * 0.8)
+    fill.position.set(center.x - maxDim, center.y + maxDim * 0.4, center.z - maxDim * 0.6)
+  }
+
+  // Ground grid on the model's XY plane plus the labeled triad at the origin;
+  // rebuilt on every swap because the grid/labels scale with the model.
+  let furniture: THREE.Object3D[] = []
+
+  let mode: RenderMode = 'shaded-edges'
+
+  const placeCamera = (): void => {
+    const distance = fitDistance(maxDim, shell.camera.aspect, shell.camera.fov)
+    shell.camera.position.set(
+      center.x + distance * 0.7,
+      center.y + distance * 0.55,
+      center.z + distance * 0.6,
+    )
+    shell.controls.target.copy(center)
+    shell.controls.update()
+  }
+
+  /** Refresh everything derived from the model's frame (grid, lights, depth
+   *  planes, render mode); `reframe` also resets the camera, otherwise the
+   *  user's viewpoint is preserved. */
+  const applyFrame = (reframe: boolean): void => {
+    if (furniture.length > 0) {
+      disposeObjects(furniture)
+      threeScene.remove(furniture[0])
+    }
+    furniture = addSceneFurniture(threeScene, maxDim, dark)
+    const grid = furniture[1] as THREE.GridHelper
+    grid.position.set(center.x, center.y, bounds.min.z)
+    placeLights()
+    if (reframe) {
+      shell.camera.near = maxDim / 100
+      shell.camera.far = maxDim * 40
+      placeCamera()
+    } else {
+      // Keep the viewpoint: only widen the depth planes so the new geometry
+      // never falls in front of near / behind far at the current distance.
+      const distance = shell.camera.position.distanceTo(shell.controls.target)
+      shell.camera.near = Math.min(maxDim / 100, distance / 1000)
+      shell.camera.far = Math.max(maxDim * 40, distance * 4)
+    }
+    shell.camera.updateProjectionMatrix()
+    applyRenderMode(cadRoot, mode, dark)
+  }
+  applyFrame(true)
+
+  // Re-fit while the layout settles; once the user orbits/zooms themselves,
+  // resizes never re-frame.
+  let interacted = false
+  const markInteracted = (): void => {
+    interacted = true
+  }
+  shell.renderer.domElement.addEventListener('pointerdown', markInteracted, { passive: true })
+  shell.renderer.domElement.addEventListener('wheel', markInteracted, { passive: true })
+
+  const viewCube = new ViewCube({ container, camera: shell.camera, controls: shell.controls, onHome: placeCamera })
+  const picking = new PickingController({ domElement: shell.renderer.domElement, camera: shell.camera, cad: cadRoot })
+
+  // Follow a host theme flip: same geometry, new furniture/material palette —
+  // the camera is never re-framed (only the depth planes are re-fitted).
+  const unsubscribeTheme = subscribeCadTheme(() => {
+    const next = getCadTheme() === 'dark'
+    if (next === dark) return
+    dark = next
+    hemisphere.groundColor.setHex(palette(dark).hemisphereGround)
+    applyFrame(false)
+    applyThemeColors(cadRoot, dark)
+  })
+
+  let disposed = false
+  /** Assembly-tree selection: the mesh name carrying the emissive highlight. */
+  let highlighted: string | null = null
+  /** Assembly-tree eye toggles: names of the meshes not drawn. */
+  const hiddenMeshes = new Set<string>()
+
+  /** (Re)apply visibility to the current top-level meshes (their edge/picking
+   *  children follow the parent's visibility automatically). */
+  const applyHidden = (): void => {
+    for (const child of cad.children) {
+      child.visible = !hiddenMeshes.has(child.name)
+    }
+  }
+
+  const setHiddenMeshes = (names: Iterable<string>): void => {
+    hiddenMeshes.clear()
+    for (const name of names) hiddenMeshes.add(name)
+    applyHidden()
+  }
+
+  /** (Re)apply the emissive highlight to the current meshes. */
+  const applyHighlight = (): void => {
+    cadRoot.traverse((child) => {
+      const mesh = child as THREE.Mesh
+      if (!mesh.isMesh) return
+      const material = mesh.material as THREE.Material
+      // Picking overlays use MeshBasicMaterial — only standard materials glow.
+      if (!('emissive' in material)) return
+      const standard = material as THREE.MeshStandardMaterial
+      if (highlighted !== null && mesh.name === highlighted) {
+        standard.emissive.setHex(0x4d6bfe)
+        standard.emissiveIntensity = 0.45
+      } else if (standard.emissive.getHex() !== 0) {
+        standard.emissive.setHex(0x000000)
+        standard.emissiveIntensity = 1
+      }
+    })
+  }
+
+  const highlightMesh = (name: string | null): void => {
+    highlighted = name
+    applyHighlight()
+  }
+
+  /** Swap the displayed geometry in place (see LiveViewer3DHandle.setScene). */
+  const setScene = (next: ViewerScene3D): void => {
+    if (disposed) return
+    cadRoot.remove(cad)
+    disposeObjects([cad])
+    picking.invalidate()
+    cad = new THREE.Group()
+    for (const mesh of next.meshes) cad.add(buildMesh(mesh, dark))
+    cadRoot.add(cad)
+    bounds = next.bounds
+    size = new THREE.Vector3(
+      bounds.max.x - bounds.min.x,
+      bounds.max.y - bounds.min.y,
+      bounds.max.z - bounds.min.z,
+    )
+    center = new THREE.Vector3(
+      (bounds.max.x + bounds.min.x) / 2,
+      (bounds.max.y + bounds.min.y) / 2,
+      (bounds.max.z + bounds.min.z) / 2,
+    )
+    maxDim = Math.max(size.x, size.y, size.z, 1e-6)
+    applyFrame(false)
+    applyHighlight()
+    applyHidden()
+  }
+
+  const frame = (): void => {
+    animationId = requestAnimationFrame(frame)
+    shell.controls.update()
+    shell.renderer.render(threeScene, shell.camera)
+    viewCube.update()
+  }
+  let animationId = requestAnimationFrame(frame)
+
+  return {
+    setWireframe(enabled: boolean): void {
+      this.setRenderMode(enabled ? 'wireframe' : 'shaded-edges')
+    },
+    setRenderMode(next: RenderMode): void {
+      mode = next
+      applyRenderMode(cadRoot, next, dark)
+    },
+    setScene,
+    highlightMesh,
+    setHiddenMeshes,
+    resetView(): void {
+      shell.camera.near = maxDim / 100
+      shell.camera.far = maxDim * 40
+      shell.camera.updateProjectionMatrix()
+      placeCamera()
+    },
+    get domElement(): HTMLCanvasElement {
+      return shell.renderer.domElement
+    },
+    dispose(): void {
+      disposed = true
+      cancelAnimationFrame(animationId)
+      unsubscribeTheme()
+      picking.dispose()
+      viewCube.dispose()
+      disposeObjects([cad, ...furniture, hemisphere, key, fill])
+      shell.dispose()
+    },
+  }
+}

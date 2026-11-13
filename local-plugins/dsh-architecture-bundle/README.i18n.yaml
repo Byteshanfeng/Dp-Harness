@@ -1,0 +1,28 @@
+# Bilingual-pair consistency record for README.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write local-plugins/dsh-architecture-bundle/README.md
+/:
+  en: 3cecb84d6912bdbb
+  zh: a1d5183f5753b64c
+/architecture-preset:
+  en: 16df24a959b442b5
+  zh: c1f420611350d664
+/architecture-preset/summary:
+  en: c80d3dd41937ccc1
+  zh: 294e6062af51a8b8
+/architecture-preset/install:
+  en: 1b094ff3b741edf8
+  zh: 3be8a79311568e37
+/architecture-preset/local-source-changes:
+  en: be55cd64f3c6201a
+  zh: 780e87c26616a5eb
+/architecture-preset/use-and-verify:
+  en: bf54103cebeead3f
+  zh: da8f76ec22367ff8
+/architecture-preset/use-and-verify/review-an-ifc-model:
+  en: 399e7bac7c1afa14
+  zh: a9a14295adc80dc3
+/architecture-preset/use-and-verify/develop-a-rectangular-concept-scheme:
+  en: 5e53e0e35c8d1d51
+  zh: a4ee58cc481cfc6f

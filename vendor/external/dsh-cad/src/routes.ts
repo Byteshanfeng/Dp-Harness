@@ -1,0 +1,363 @@
+/**
+ * Same-origin scene routes:
+ * - GET /dsh-cad/scene/<viewId>  — JSON scenes (cad_view files)
+ * - GET /dsh-cad/bin/<viewId>    — packed binary scenes (modeling document)
+ * - GET /dsh-cad/demo-scene      — the built-in demo example, parsed from the
+ *                                  packaged demo-bracket.brep by OCCT (local
+ *                                  file ↔ editor display correspondence)
+ * - GET /dsh-cad/docs            — the workspace document file space (list)
+ * - POST /dsh-cad/docs/delete    — remove a document (panel delete button)
+ */
+import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { SceneStore } from './store.js'
+import type { BinarySceneStore } from './modeling/bin-store.js'
+import type { DocumentRegistry } from './modeling/registry.js'
+import { assemblyTreePayload } from './modeling/assembly.js'
+import { featureTreePayload } from './modeling/feature-tree.js'
+import { convert } from './convert/index.js'
+
+export const SCENE_ROUTE_PATH = '/dsh-cad/scene'
+export const BIN_ROUTE_PATH = '/dsh-cad/bin'
+export const DEMO_SCENE_ROUTE_PATH = '/dsh-cad/demo-scene'
+export const DOCS_ROUTE_PATH = '/dsh-cad/docs'
+export const DOCS_DELETE_ROUTE_PATH = '/dsh-cad/docs/delete'
+export const ASSEMBLY_ROUTE_PATH = '/dsh-cad/asm'
+export const FEATURE_TREE_ROUTE_PATH = '/dsh-cad/tree'
+
+/** The built-in demo examples (packaged as lib/demo-<part>.brep). */
+export const DEMO_PARTS = ['bracket', 'flange', 'shaft'] as const
+export type DemoPart = (typeof DEMO_PARTS)[number]
+
+/** Register the scene route on the shared HTTP server. Returns a disposer. */
+export function registerSceneRoute(server: { register: (route: SceneRoute) => () => void }, store: SceneStore): () => void {
+  return server.register({
+    kind: 'prefix',
+    path: SCENE_ROUTE_PATH,
+    handler: async (req: IncomingMessage, res: ServerResponse) => {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const segments = url.pathname.split('/').filter((segment) => segment !== '')
+      // ['/dsh-cad', 'scene', '<viewId>'] → viewId is the 3rd segment.
+      const viewId = segments[2]
+      if (req.method !== 'GET' || viewId === undefined) {
+        res.writeHead(404, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: 'not found' }))
+        return
+      }
+      const scene = await store.get(viewId)
+      if (scene === null) {
+        res.writeHead(404, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: 'unknown scene' }))
+        return
+      }
+      const etag = store.etag(scene)
+      if (req.headers['if-none-match'] === etag) {
+        res.writeHead(304)
+        res.end()
+        return
+      }
+      const body = Buffer.from(JSON.stringify(scene))
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        'content-length': body.length,
+        'cache-control': 'private, max-age=31536000, immutable',
+        etag,
+      })
+      res.end(body)
+    },
+  })
+}
+
+interface SceneRoute {
+  kind: 'prefix' | 'exact'
+  path: string
+  handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
+}
+
+/** Register the binary scene route. Returns a disposer. */
+export function registerBinRoute(server: { register: (route: SceneRoute) => () => void }, store: BinarySceneStore): () => void {
+  return server.register({
+    kind: 'prefix',
+    path: BIN_ROUTE_PATH,
+    handler: async (req: IncomingMessage, res: ServerResponse) => {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const segments = url.pathname.split('/').filter((segment) => segment !== '')
+      // ['/dsh-cad', 'bin', '<viewId>'] → viewId is the 3rd segment.
+      const viewId = segments[2]
+      if (req.method !== 'GET' || viewId === undefined) {
+        res.writeHead(404, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: 'not found' }))
+        return
+      }
+      const entry = await store.get(viewId)
+      if (entry === null) {
+        res.writeHead(404, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: 'unknown scene' }))
+        return
+      }
+      if (req.headers['if-none-match'] === entry.etag) {
+        res.writeHead(304)
+        res.end()
+        return
+      }
+      res.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-length': entry.buffer.length,
+        'cache-control': 'no-store',
+        etag: entry.etag,
+      })
+      res.end(entry.buffer)
+    },
+  })
+}
+
+/** Parse a packaged demo BRep once per part (OCCT import worker), cached. */
+const demoCache = new Map<string, Promise<{ body: Buffer; etag: string }>>()
+
+function loadDemoScene(part: string): Promise<{ body: Buffer; etag: string }> {
+  let entry = demoCache.get(part)
+  if (entry === undefined) {
+    entry = (async () => {
+      const brepPath = new URL(`./demo-${part}.brep`, import.meta.url)
+      const buffer = await readFile(brepPath)
+      const scene = await convert(buffer, 'brep', `demo-${part}`)
+      const body = Buffer.from(JSON.stringify(scene))
+      return { body, etag: `"demo-${part}-${createHash('sha1').update(body).digest('hex')}"` }
+    })()
+    demoCache.set(part, entry)
+    entry.catch(() => demoCache.delete(part))
+  }
+  return entry
+}
+
+/** Register the demo-scene route: GET /dsh-cad/demo-scene?part=<bracket|flange|shaft>. */
+export function registerDemoRoute(server: { register: (route: SceneRoute) => () => void }): () => void {
+  return server.register({
+    kind: 'exact',
+    path: DEMO_SCENE_ROUTE_PATH,
+    handler: async (req: IncomingMessage, res: ServerResponse) => {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const part = url.searchParams.get('part') ?? 'bracket'
+      if (req.method !== 'GET' || !(DEMO_PARTS as readonly string[]).includes(part)) {
+        res.writeHead(404, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: part === undefined ? 'not found' : `unknown demo part: ${part}` }))
+        return
+      }
+      try {
+        const cached = await loadDemoScene(part)
+        if (req.headers['if-none-match'] === cached.etag) {
+          res.writeHead(304)
+          res.end()
+          return
+        }
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          'content-length': cached.body.length,
+          'cache-control': 'private, max-age=31536000, immutable',
+          etag: cached.etag,
+        })
+        res.end(cached.body)
+      } catch (cause: unknown) {
+        res.writeHead(500, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: cause instanceof Error ? cause.message : String(cause) }))
+      }
+    },
+  })
+}
+
+/** Register the docs file-space route: GET /dsh-cad/docs (list documents). */
+export function registerDocsRoute(
+  server: { register: (route: SceneRoute) => () => void },
+  registry: DocumentRegistry,
+  binStore: BinarySceneStore,
+): () => void {
+  return server.register({
+    kind: 'exact',
+    path: DOCS_ROUTE_PATH,
+    handler: async (req: IncomingMessage, res: ServerResponse) => {
+      if (req.method !== 'GET') {
+        res.writeHead(404, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: 'not found' }))
+        return
+      }
+      try {
+        const docs = await registry.list()
+        const entries = await Promise.all(
+          docs.map(async (doc) => ({
+            id: doc.id,
+            name: doc.name,
+            bodies: doc.bodyCount,
+            updatedAt: doc.updatedAt,
+            // Op count: the panel's liveness signal. It polls this list and
+            // re-fetches the scene when the tracked document's version moves,
+            // so the viewport follows modeling ops even when the conversation
+            // meta pipeline is stale (host UI drift).
+            version: doc.opCount,
+            // Preview URL only when a published scene exists (memory or mirror).
+            ...(await binStore.has(doc.id) ? { sceneUrl: `${BIN_ROUTE_PATH}/${doc.id}` } : {}),
+          })),
+        )
+        // The panel's host-independent channel: with ?session=<id>, also
+        // report that session's bound (active) document and its versioned
+        // scene URL. The resident panel polls this when the conversation
+        // meta pipeline is unavailable (host version drift, cold start) —
+        // its own route keeps the Part tab live across host UI changes.
+        const sessionId = new URL(req.url ?? '/', 'http://localhost').searchParams.get('session')
+        let active: { id: string; name: string; version: number; sceneUrl?: string } | undefined
+        if (sessionId !== null) {
+          const bound = await registry.bindingOf(sessionId)
+          const doc = bound === null ? undefined : docs.find((entry) => entry.id === bound)
+          if (doc !== undefined) {
+            active = {
+              id: doc.id,
+              name: doc.name,
+              version: doc.opCount,
+              ...(await binStore.has(doc.id) ? { sceneUrl: `${BIN_ROUTE_PATH}/${doc.id}?v=${doc.opCount}` } : {}),
+            }
+          }
+        }
+        const body = Buffer.from(JSON.stringify({ docs: entries, ...(active !== undefined ? { active } : {}) }))
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          'content-length': body.length,
+          'cache-control': 'no-store',
+        })
+        res.end(body)
+      } catch (cause: unknown) {
+        res.writeHead(500, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: cause instanceof Error ? cause.message : String(cause) }))
+      }
+    },
+  })
+}
+
+/** Register the docs delete route: POST /dsh-cad/docs/delete?id=<docId>. */
+export function registerDocsDeleteRoute(
+  server: { register: (route: SceneRoute) => () => void },
+  registry: DocumentRegistry,
+): () => void {
+  return server.register({
+    kind: 'exact',
+    path: DOCS_DELETE_ROUTE_PATH,
+    handler: async (req: IncomingMessage, res: ServerResponse) => {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const id = url.searchParams.get('id')
+      if (req.method !== 'POST' || id === null || id === '') {
+        res.writeHead(404, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: 'not found' }))
+        return
+      }
+      try {
+        const removed = await registry.remove(id)
+        if (!removed) {
+          res.writeHead(404, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: `unknown document: ${id}` }))
+          return
+        }
+        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+        res.end(JSON.stringify({ deleted: id }))
+      } catch (cause: unknown) {
+        res.writeHead(500, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: cause instanceof Error ? cause.message : String(cause) }))
+      }
+    },
+  })
+}
+
+/**
+ * Register the assembly-tree route: GET /dsh-cad/asm/<docId> returns the
+ * panel's PARTS + CONSTRAINTS data (instance names/colors, resolved
+ * constraint rows), folded from the persisted op log — no worker round-trip,
+ * so it keeps serving after restarts and for non-active documents.
+ */
+export function registerAssemblyRoute(
+  server: { register: (route: SceneRoute) => () => void },
+  registry: DocumentRegistry,
+): () => void {
+  return server.register({
+    kind: 'prefix',
+    path: ASSEMBLY_ROUTE_PATH,
+    handler: async (req: IncomingMessage, res: ServerResponse) => {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const segments = url.pathname.split('/').filter((segment) => segment !== '')
+      // ['/dsh-cad', 'asm', '<docId>'] → docId is the 3rd segment.
+      const docId = segments[2]
+      if (req.method !== 'GET' || docId === undefined) {
+        res.writeHead(404, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: 'not found' }))
+        return
+      }
+      try {
+        const document = await registry.open(docId)
+        if (document === null) {
+          res.writeHead(404, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: `unknown document: ${docId}` }))
+          return
+        }
+        await document.restore()
+        const meta = await registry.resolve(docId)
+        const body = Buffer.from(
+          JSON.stringify({ ...(meta === null ? {} : { name: meta.name }), ...assemblyTreePayload(document.doc) }),
+        )
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          'content-length': body.length,
+          'cache-control': 'no-store',
+        })
+        res.end(body)
+      } catch (cause: unknown) {
+        res.writeHead(500, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: cause instanceof Error ? cause.message : String(cause) }))
+      }
+    },
+  })
+}
+
+export type { SceneRoute }
+
+/**
+ * Register the feature-tree route: GET /dsh-cad/tree/<docId> returns the Part
+ * tab's structure panel (sketches + features in op order), folded from the
+ * persisted op log — no worker round-trip, so it keeps serving after restarts
+ * and for non-active documents (same pattern as the assembly tree).
+ */
+export function registerFeatureTreeRoute(
+  server: { register: (route: SceneRoute) => () => void },
+  registry: DocumentRegistry,
+): () => void {
+  return server.register({
+    kind: 'prefix',
+    path: FEATURE_TREE_ROUTE_PATH,
+    handler: async (req: IncomingMessage, res: ServerResponse) => {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const segments = url.pathname.split('/').filter((segment) => segment !== '')
+      // ['/dsh-cad', 'tree', '<docId>'] → docId is the 3rd segment.
+      const docId = segments[2]
+      if (req.method !== 'GET' || docId === undefined) {
+        res.writeHead(404, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: 'not found' }))
+        return
+      }
+      try {
+        const document = await registry.open(docId)
+        if (document === null) {
+          res.writeHead(404, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: `unknown document: ${docId}` }))
+          return
+        }
+        await document.restore()
+        const body = Buffer.from(JSON.stringify(featureTreePayload(document.doc)))
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          'content-length': body.length,
+          'cache-control': 'no-store',
+        })
+        res.end(body)
+      } catch (cause: unknown) {
+        res.writeHead(500, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: cause instanceof Error ? cause.message : String(cause) }))
+      }
+    },
+  })
+}

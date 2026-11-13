@@ -1,6 +1,6 @@
 {
-  "name": "DeepSeek Harness",
-  "short_name": "DSH",
+  "name": "图灵Harness",
+  "short_name": "图灵",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

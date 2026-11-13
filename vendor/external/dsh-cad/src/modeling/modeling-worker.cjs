@@ -1,0 +1,655 @@
+/**
+ * Modeling worker entry (plain CJS — the emscripten loader must not be pulled
+ * through ESM; see the M0 notes on ERR_AMBIGUOUS_MODULE_SYNTAX).
+ *
+ * Protocol (main → worker): {jobId, op} where op replays one document
+ * operation. (worker → main): {jobId, ok, result} with transferable buffers
+ * for tessellation data.
+ */
+'use strict'
+
+const { parentPort } = require('node:worker_threads')
+const path = require('node:path')
+const fs = require('node:fs')
+const { createRequire } = require('node:module')
+const { pathToFileURL } = require('node:url')
+const { createOcctTsAdapter } = require('./occtts-adapter.cjs')
+const { createOcctBridge, loadSharedOcctModule } = require('./occt-bridge.cjs')
+const { loadCadorange } = require('./cadorange-bridge.cjs')
+const { createCadorangeAdapter } = require('./cadorange-adapter.cjs')
+
+const require3 = createRequire(__filename)
+// The ES6 emscripten build reads a global __dirname when its factory runs.
+if (typeof globalThis.__dirname === 'undefined') globalThis.__dirname = __dirname
+
+// Kernel selection: cadorange is the primary backend (agent-native runtime
+// over the occt.ts wasm), the direct occt.ts adapter is the fallback; the
+// opencascade.js tier was removed in v0.15.1. `adapter` carries whichever.
+let adapter = null
+let kernelName = 'occt.ts'
+
+/**
+ * Reject a degenerate result BEFORE registering it: the kernel cannot
+ * tessellate a self-intersecting BRep (it fails deep inside the mesher with
+ * a cryptic error), and an unrenderable body in the document helps no one.
+ */
+function assertUsable(shape, what, hint) {
+  if (adapter.isValid(shape) === false) {
+    throw new Error(`the ${what} produced an invalid shape (self-intersecting or degenerate)${hint === undefined ? '' : `: ${hint}`}`)
+  }
+}
+
+/** bodyId → { shape, name } — the live document (kernel-owned shapes). */
+const bodies = new Map()
+let nextBodyNumber = 1
+
+/** instanceId → { instanceId, bodyId, name, translate, rotate } — the assembly. */
+const instances = new Map()
+
+/** sketchName → { name, profile } — named, editable profiles (Sketch1…).
+ * Features reference sketches BY NAME (extrude/revolve/sweep `sketch` param);
+ * the profile is resolved at execution time, so a redefined sketch (the
+ * document op is rewritten in place + the log replayed) rebuilds every
+ * dependent feature. */
+const sketches = new Map()
+
+/** Resolve a named sketch's profile for a referencing feature op. */
+function requireSketch(name, what) {
+  const sketch = sketches.get(name)
+  if (sketch === undefined) throw new Error(`unknown sketch: ${name} — create it first (${what} references it by name)`)
+  return sketch.profile
+}
+
+const triplet = (value) => (Array.isArray(value) && value.length === 3 ? value : [0, 0, 0])
+
+function instancesList() {
+  const list = []
+  for (const instance of instances.values()) {
+    list.push({
+      instanceId: instance.instanceId,
+      bodyId: instance.bodyId,
+      name: instance.name,
+      translate: triplet(instance.translate),
+      rotate: triplet(instance.rotate),
+    })
+  }
+  return list
+}
+
+function meshOf(shape, name) {
+  const { positions, indices } = adapter.tessellate(shape)
+  const normals = adapter.faceNormals(positions, indices)
+  return {
+    name,
+    positions,
+    normals,
+    indices,
+    vertexCount: positions.length / 3,
+    triangleCount: indices.length / 3,
+  }
+}
+
+/**
+ * Swap a body's live shape, freeing the superseded one. Kernel-owned memory
+ * needs explicit disposal on the cadorange backend; the direct backends have
+ * no adapter.dispose and are skipped (unchanged behaviour).
+ */
+function replaceShape(body, shape) {
+  const previous = body.shape
+  body.shape = shape
+  if (previous !== undefined && previous !== null && previous !== shape && typeof adapter.dispose === 'function') {
+    adapter.dispose(previous)
+  }
+}
+
+/** Drop one body, freeing its shape when the backend owns the lifetime. */
+function disposeBody(entry) {
+  if (entry !== undefined && typeof adapter.dispose === 'function') adapter.dispose(entry.shape)
+}
+
+async function applyOp(op) {
+  switch (op.kind) {
+    case 'create_prim': {
+      const bodyId = op.bodyId
+      const shape = adapter.makePrim(op.prim, op.params ?? {})
+      bodies.set(bodyId, { shape, name: op.name ?? bodyId })
+      return { bodyId, name: bodies.get(bodyId).name, mesh: meshOf(shape, bodies.get(bodyId).name) }
+    }
+    case 'extrude_profile': {
+      const bodyId = op.bodyId
+      // `profile` (segments/circle object) supersedes the legacy flat `points`;
+      // both forms flow through the same curve-aware builder. A named sketch
+      // (`sketch`) supersedes both — the profile resolves at execution time.
+      const profile = op.sketch !== undefined ? requireSketch(op.sketch, 'extrude_profile') : (op.profile ?? op.points)
+      const shape = adapter.extrudeProfile2D(profile, op.height ?? 10, op.base ?? 0)
+      bodies.set(bodyId, { shape, name: op.name ?? bodyId })
+      return { bodyId, name: bodies.get(bodyId).name, mesh: meshOf(shape, bodies.get(bodyId).name) }
+    }
+    case 'revolve': {
+      const bodyId = op.bodyId
+      const shape = adapter.makeRevolve(op.sketch !== undefined ? requireSketch(op.sketch, 'revolve') : op.profile, { axis: op.axis, at: op.at, angle: op.angle })
+      assertUsable(shape, 'revolve', '检查轮廓是否全部位于轴的一侧且共面')
+      bodies.set(bodyId, { shape, name: op.name ?? bodyId })
+      return { bodyId, name: bodies.get(bodyId).name, mesh: meshOf(shape, bodies.get(bodyId).name) }
+    }
+    case 'chamfer': {
+      const body = requireShape(op.target, 'chamfer')
+      const shape = adapter.chamferAll(body.shape, op.distance)
+      assertUsable(shape, 'chamfer', '距离可能超出相邻面')
+      replaceShape(body, shape)
+      return { bodyId: op.target, name: body.name, mesh: meshOf(shape, body.name) }
+    }
+    case 'pattern': {
+      const body = bodies.get(op.target)
+      if (body === undefined) throw new Error(`unknown body: ${op.target}`)
+      const count = Math.max(1, Math.trunc(op.count))
+      const created = []
+      for (let i = 1; i < count; i++) {
+        // Unique copy ids even when the same target is patterned repeatedly:
+        // the naive `<target>p<i>` collides with the previous pattern's
+        // copies and silently overwrites them (issue #6). The rule is
+        // deterministic, so replaying the op log reproduces the same ids.
+        let seq = i
+        let id = `${op.target}p${seq}`
+        while (bodies.has(id)) id = `${op.target}p${++seq}`
+        let shape
+        if (op.mode === 'circular') {
+          // Rotation about a principal axis through `at`: translate in, rotate,
+          // translate back (transform applies Euler rotations about the origin).
+          const axis = op.axis ?? [0, 0, 1]
+          const at = op.at ?? [0, 0, 0]
+          const step = ((op.angle ?? 360) / count) * i
+          const principal = Math.abs(axis[0]) > 0.9 ? [step, 0, 0]
+            : Math.abs(axis[1]) > 0.9 ? [0, step, 0]
+            : Math.abs(axis[2]) > 0.9 ? [0, 0, step]
+            : null
+          if (principal === null) throw new Error('circular pattern axes must be principal (+X/+Y/+Z)')
+          shape = adapter.transform(adapter.transform(
+            adapter.transform(body.shape, { translate: [-at[0], -at[1], -at[2]] }),
+            { rotate: principal },
+          ), { translate: [at[0], at[1], at[2]] })
+        } else {
+          shape = adapter.transform(body.shape, {
+            translate: [op.delta[0] * i, op.delta[1] * i, op.delta[2] * i],
+          })
+        }
+        const name = `${body.name}·${seq}`
+        bodies.set(id, { shape, name })
+        created.push({ bodyId: id, name, mesh: meshOf(shape, name) })
+      }
+      return { bodyId: op.target, created }
+    }
+    case 'loft': {
+      const bodyId = op.bodyId
+      const shape = adapter.makeLoft(op.sections, { solid: op.solid, ruled: op.ruled, smooth: op.smooth })
+      assertUsable(shape, 'loft', '检查各截面是否闭合、点数是否合理；平滑截面要求截面点共面且不重复')
+      bodies.set(bodyId, { shape, name: op.name ?? bodyId })
+      return { bodyId, name: bodies.get(bodyId).name, mesh: meshOf(shape, bodies.get(bodyId).name) }
+    }
+    case 'sweep': {
+      const bodyId = op.bodyId
+      const shape = adapter.makeSweep(op.sketch !== undefined ? requireSketch(op.sketch, 'sweep') : op.profile, op.path)
+      assertUsable(shape, 'sweep', '路径上的尖角配合较大截面会自交——把拐角改为圆滑/倒角路径')
+      bodies.set(bodyId, { shape, name: op.name ?? bodyId })
+      return { bodyId, name: bodies.get(bodyId).name, mesh: meshOf(shape, bodies.get(bodyId).name) }
+    }
+    case 'shell': {
+      const body = requireShape(op.target, 'shell')
+      if (typeof adapter.shell !== 'function') throw new Error('shell requires the occt.ts kernel backend — it is unavailable, reinstall dsh-cad')
+      const faces = Array.isArray(op.faces) && op.faces.length > 0 ? op.faces : matchFacesByNormal(body.shape, op.openNormals)
+      const shape = adapter.shell(body.shape, op.thickness, faces)
+      assertUsable(shape, 'shell', '检查壁厚是否超出几何允许')
+      replaceShape(body, shape)
+      return { bodyId: op.target, name: body.name, volume: Math.abs(adapter.volume(shape)), mesh: meshOf(shape, body.name) }
+    }
+    case 'draft': {
+      const body = requireShape(op.target, 'draft')
+      if (typeof adapter.draft !== 'function') throw new Error('draft requires the occt.ts kernel backend — it is unavailable, reinstall dsh-cad')
+      const shape = adapter.draft(body.shape, op.angle, op.direction)
+      assertUsable(shape, 'draft', '检查拔模角度是否超出几何允许')
+      replaceShape(body, shape)
+      return { bodyId: op.target, name: body.name, volume: Math.abs(adapter.volume(shape)), mesh: meshOf(shape, body.name) }
+    }
+    case 'boolean': {
+      const target = requireShape(op.target, 'boolean')
+      const tools = op.tools.map((id) => requireShape(id, 'boolean').shape)
+      const shape = adapter.boolean(op.op, target.shape, tools)
+      target.shape = shape
+      // Consumed tool bodies are removed from the document (CAD convention).
+      const removed = []
+      for (const id of op.tools) {
+        if (id === op.target) continue
+        const entry = bodies.get(id)
+        if (bodies.delete(id)) {
+          removed.push(id)
+          disposeBody(entry)
+        }
+      }
+      return { bodyId: op.target, name: target.name, removed, mesh: meshOf(shape, target.name) }
+    }
+    case 'fillet': {
+      const body = requireShape(op.target, 'fillet')
+      const shape = adapter.filletAll(body.shape, op.radius ?? 1)
+      assertUsable(shape, 'fillet', '半径可能超出相邻面')
+      replaceShape(body, shape)
+      return { bodyId: op.target, name: body.name, mesh: meshOf(shape, body.name) }
+    }
+    case 'transform': {
+      const body = requireShape(op.target, 'transform')
+      const shape = adapter.transform(body.shape, {
+        translate: op.translate,
+        rotate: op.rotate,
+        mirror: op.mirror,
+      })
+      replaceShape(body, shape)
+      return { bodyId: op.target, name: body.name, mesh: meshOf(shape, body.name) }
+    }
+    case 'tessellate_all': {
+      const meshes = []
+      for (const [bodyId, body] of bodies) {
+        if (body.shape === null || body.shape === undefined) continue // hosted bodies re-mesh via their ops
+        meshes.push({ bodyId, name: body.name, ...meshOf(body.shape, body.name) })
+      }
+      return { meshes }
+    }
+    case 'export': {
+      const body = requireShape(op.target, 'export')
+      const bytes = adapter.exportFile(body.shape, op.format)
+      return { bytes: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) }
+    }
+    case 'drawing': {
+      return drawingViews(op)
+    }
+    case 'assembly_insert': {
+      const body = bodies.get(op.bodyId)
+      if (body === undefined) throw new Error(`unknown body: ${op.bodyId}`)
+      if (instances.has(op.instanceId)) throw new Error(`instance already exists: ${op.instanceId}`)
+      instances.set(op.instanceId, {
+        instanceId: op.instanceId,
+        bodyId: op.bodyId,
+        name: op.name ?? body.name,
+        translate: triplet(op.translate),
+        rotate: triplet(op.rotate),
+      })
+      return { instanceId: op.instanceId, bodyId: op.bodyId, instances: instancesList() }
+    }
+    case 'assembly_transform': {
+      const instance = instances.get(op.instanceId)
+      if (instance === undefined) throw new Error(`unknown instance: ${op.instanceId}`)
+      if (op.translate !== undefined) instance.translate = triplet(op.translate)
+      if (op.rotate !== undefined) instance.rotate = triplet(op.rotate)
+      return { instanceId: op.instanceId, instances: instancesList() }
+    }
+    case 'assembly_remove': {
+      if (!instances.delete(op.instanceId)) throw new Error(`unknown instance: ${op.instanceId}`)
+      return { instanceId: op.instanceId, removed: op.instanceId, instances: instancesList() }
+    }
+    case 'assembly_list': {
+      return { instances: instancesList() }
+    }
+    case 'assembly_joint': {
+      // Metadata-only op: joint specs live in the document log; the solved
+      // placement arrives separately as an assembly_transform op. The worker
+      // just guards the instance reference so a bad id fails loudly.
+      if (!instances.has(op.instanceId)) throw new Error(`unknown instance: ${op.instanceId}`)
+      return { instanceId: op.instanceId, instances: instancesList() }
+    }
+    case 'assembly_connect': {
+      if (!instances.has(op.instanceId)) throw new Error(`unknown instance: ${op.instanceId}`)
+      if (!instances.has(op.parent)) throw new Error(`unknown instance: ${op.parent}`)
+      return { instanceId: op.instanceId, instances: instancesList() }
+    }
+    case 'assembly_joint_value': {
+      if (!instances.has(op.instanceId)) throw new Error(`unknown instance: ${op.instanceId}`)
+      return { instanceId: op.instanceId, instances: instancesList() }
+    }
+    case 'assembly_explode': {
+      if (typeof op.factor !== 'number' || !Number.isFinite(op.factor)) throw new Error('explode factor must be a finite number')
+      return { instances: instancesList() }
+    }
+    case 'import_step': {
+      return importStep(op)
+    }
+    case 'constraints': {
+      // Persist-only op: the constraint model lives in the document log and
+      // is solved on the main thread (Ansatz wasm); the worker stores nothing.
+      return { stored: true, entities: op.model.entities.length, constraints: op.model.constraints.length }
+    }
+    case 'sketch_set': {
+      if (op.profile === undefined || op.profile === null) throw new Error('a sketch needs a profile (segments object, circle object, or flat points loop)')
+      // Display payload for the viewport (visualization-only; nulls when the
+      // profile is not discretizable or the backend lacks the helpers).
+      let wire = null
+      let points = null
+      let fill = null
+      if (typeof adapter.sketchWirePoints === 'function') {
+        const discretized = adapter.sketchWirePoints(op.profile)
+        if (discretized !== null) {
+          wire = discretized.polyline
+          points = discretized.vertices.length > 0 ? discretized.vertices : null
+        }
+      }
+      if (typeof adapter.sketchFaceMesh === 'function') {
+        fill = adapter.sketchFaceMesh(op.profile)
+      }
+      sketches.set(op.name, { name: op.name, profile: op.profile })
+      return {
+        sketch: op.name,
+        ...(wire === null ? {} : { wire }),
+        ...(points === null ? {} : { points }),
+        ...(fill === null ? {} : { fill }),
+      }
+    }
+    case 'sketch_delete': {
+      if (!sketches.delete(op.name)) throw new Error(`unknown sketch: ${op.name}`)
+      return { sketch: op.name, deleted: op.name }
+    }
+    case 'export_assembly': {
+      if (instances.size === 0) throw new Error('the assembly is empty')
+      // Structured document export (occt.ts >= 0.7.0): one root product plus
+      // one named, placed child per instance — instance separation survives
+      // the STEP file. Duplicate names get the same ·N suffix the viewer
+      // composer uses.
+      if (op.format === 'step' && typeof adapter.exportStepDocument === 'function') {
+        const nameUse = new Map()
+        const nodes = []
+        for (const instance of instances.values()) {
+          const body = bodies.get(instance.bodyId)
+          if (body === undefined || body.shape === null || body.shape === undefined) continue // stale instance of a consumed body
+          const seen = nameUse.get(instance.name) ?? 0
+          nameUse.set(instance.name, seen + 1)
+          const name = seen === 0 ? instance.name : `${instance.name}·${seen + 1}`
+          nodes.push({
+            name,
+            shape: body.shape,
+            translate: triplet(instance.translate),
+            rotate: triplet(instance.rotate),
+          })
+        }
+        if (nodes.length === 0) throw new Error('no instance references a live body')
+        const bytes = adapter.exportStepDocument(nodes)
+        return { bytes: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), instances: instancesList() }
+      }
+      // STL (a single mesh — no structure to keep) and the legacy fallback
+      // backend: fuse the placed instances into one solid (the STEP carries
+      // the union; instance separation stays in the assembly scene/document).
+      let compound = null
+      let added = 0
+      for (const instance of instances.values()) {
+        const body = bodies.get(instance.bodyId)
+        if (body === undefined) continue // stale instance of a consumed body
+        const placed = adapter.transform(body.shape, {
+          translate: instance.translate,
+          rotate: instance.rotate,
+        })
+        compound = compound === null ? placed : adapter.boolean('fuse', compound, [placed])
+        added++
+      }
+      if (added === 0) throw new Error('no instance references a live body')
+      const bytes = adapter.exportFile(compound, op.format)
+      return { bytes: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), instances: instancesList() }
+    }
+    case 'volume': {
+      const body = requireShape(op.target, 'volume')
+      const result = { volume: Math.abs(adapter.volume(body.shape)) }
+      if (typeof adapter.centroid === 'function') {
+        try { result.centroid = adapter.centroid(body.shape) } catch { /* centroid optional */ }
+      }
+      return result
+    }
+    case 'delete': {
+      const entry = bodies.get(op.target)
+      if (!bodies.delete(op.target)) throw new Error(`unknown body: ${op.target}`)
+      disposeBody(entry)
+      return { deleted: op.target }
+    }
+    case 'reset': {
+      for (const body of bodies.values()) disposeBody(body)
+      bodies.clear()
+      instances.clear()
+      sketches.clear()
+      stepImportCache.clear()
+      nextBodyNumber = 1
+      return { cleared: true }
+    }
+    default:
+      throw new Error(`unknown op: ${op.kind}`)
+  }
+}
+
+/** Standard third/first-angle drawing views (GB first-angle arrangement). */
+const DEFAULT_DRAWING_VIEWS = [
+  { name: 'front', dir: [0, -1, 0], xDir: [1, 0, 0] },
+  { name: 'top', dir: [0, 0, 1], xDir: [1, 0, 0] },
+  { name: 'left', dir: [-1, 0, 0], xDir: [0, 1, 0] },
+  { name: 'iso', dir: [1, -1, 1], xDir: [1, 1, 0] },
+]
+
+/**
+ * The occt.ts kernel (true OCCT hidden-line removal) — the one and only
+ * drawing engine. Lazily loaded on the first drawing op and cached,
+ * including failures, so a missing dist costs one filesystem probe per
+ * worker, not per drawing.
+ */
+let occtBridge = null
+let occtBridgeTried = false
+async function getOcctBridge() {
+  if (occtBridgeTried) return occtBridge
+  occtBridgeTried = true
+  try {
+    occtBridge = await createOcctBridge()
+    if (occtBridge !== null) {
+      console.log(`[dsh-cad] occt.ts kernel loaded (OCCT ${occtBridge.occtVersion}) from ${occtBridge.distDir}`)
+    }
+  } catch (error) {
+    console.warn(`[dsh-cad] occt.ts kernel failed to load: ${error instanceof Error ? error.message : error}`)
+    occtBridge = null
+  }
+  return occtBridge
+}
+
+/** Faces (1-based) whose outward plane-normal matches the target normals. */
+function matchFacesByNormal(shape, openNormals) {
+  if (!Array.isArray(openNormals) || openNormals.length === 0) return []
+  if (typeof adapter.describe !== 'function') throw new Error('face matching by normal requires the occt.ts kernel backend')
+  const desc = adapter.describe(shape)
+  const faces = Array.isArray(desc.faces) ? desc.faces : []
+  const picked = []
+  for (const target of openNormals) {
+    const tlen = Math.hypot(target[0], target[1], target[2])
+    if (tlen < 1e-12) continue
+    const tn = [target[0] / tlen, target[1] / tlen, target[2] / tlen]
+    let best = null
+    let bestScore = -Infinity
+    for (const face of faces) {
+      if (face.surface !== 'plane' || !Array.isArray(face.normal)) continue
+      const dot = face.normal[0] * tn[0] + face.normal[1] * tn[1] + face.normal[2] * tn[2]
+      if (Math.abs(dot) < 0.9) continue
+      const outward = dot >= 0 ? 1 : -1
+      const proj = (face.origin[0] * tn[0] + face.origin[1] * tn[1] + face.origin[2] * tn[2]) * outward
+      const score = Math.abs(dot) + proj * 1e-3
+      if (score > bestScore) { bestScore = score; best = face.index }
+    }
+    if (best !== null) picked.push(best)
+  }
+  return picked
+}
+
+/** Resolve a body's live shape (single-kernel: always present). */
+function requireShape(bodyId, what) {
+  const body = bodies.get(bodyId)
+  if (body === undefined) throw new Error(`unknown body: ${bodyId}`)
+  if (body.shape === null || body.shape === undefined) {
+    throw new Error(`${bodyId} has no live shape (${what})`)
+  }
+  return body
+}
+
+/**
+ * Parsed STEP-assembly structures keyed by asset path — the probe pass and
+ * the materialize pass (plus every replay) reuse one parse. Cleared on reset
+ * with the bodies it keeps alive.
+ */
+const stepImportCache = new Map()
+
+/**
+ * import_step: parse a STEP assembly document into unique part bodies +
+ * placed instances (cadorange backend). Two phases share one cached parse:
+ *   - probe (no `bodies`): return the structure (names/keys/placements, no
+ *     geometry) so the main thread can assign body/instance ids;
+ *   - materialize (`bodies` + `instances`): create the bodies/instances with
+ *     the caller-assigned ids — the recorded op replays identically.
+ */
+async function importStep(op) {
+  if (typeof adapter.importStepDocument !== 'function') {
+    throw new Error('STEP 装配导入需要 cadorange 内核（当前直连后端不支持结构化读取）')
+  }
+  if (typeof op.path !== 'string' || op.path === '') throw new Error('import_step needs an asset path')
+  let cached = stepImportCache.get(op.path)
+  if (cached === undefined) {
+    const bytes = fs.readFileSync(op.path)
+    cached = adapter.importStepDocument(bytes)
+    stepImportCache.set(op.path, cached)
+  }
+  const { parts, leaves } = cached
+  if (op.bodies === undefined) {
+    return {
+      stepStructure: {
+        parts: parts.map((part) => ({ name: part.name, key: part.key })),
+        leaves: leaves.map((leaf) => ({ part: leaf.part, name: leaf.name, translate: leaf.translate, rotate: leaf.rotate })),
+      },
+    }
+  }
+  // Materialize: the caller's assignments must match this parse exactly — a
+  // kernel/file change between record and replay fails loudly here.
+  if (!Array.isArray(op.bodies) || op.bodies.length !== parts.length) {
+    throw new Error(`import_step: op assigns ${Array.isArray(op.bodies) ? op.bodies.length : 0} bodies but the file parses into ${parts.length} — re-import the file`)
+  }
+  const meshes = []
+  for (let i = 0; i < parts.length; i++) {
+    const assigned = op.bodies[i]
+    const part = parts[i]
+    // Every body gets its own kernel object — disposing one body never
+    // dangles a sibling sharing the cached parse.
+    const shape = typeof adapter.copyShape === 'function' ? adapter.copyShape(part.shape) : part.shape
+    bodies.set(assigned.bodyId, { shape, name: assigned.name ?? part.name })
+    meshes.push({ bodyId: assigned.bodyId, name: assigned.name ?? part.name, ...meshOf(shape, assigned.name ?? part.name) })
+  }
+  for (const instance of op.instances ?? []) {
+    if (instances.has(instance.instanceId)) throw new Error(`instance already exists: ${instance.instanceId}`)
+    if (!bodies.has(instance.bodyId)) throw new Error(`import_step instance references unknown body: ${instance.bodyId}`)
+    instances.set(instance.instanceId, {
+      instanceId: instance.instanceId,
+      bodyId: instance.bodyId,
+      name: instance.name,
+      translate: triplet(instance.translate),
+      rotate: triplet(instance.rotate),
+    })
+  }
+  return { bodies: op.bodies.map((entry) => entry.bodyId), meshes, instances: instancesList() }
+}
+
+async function drawingViews(op) {
+  const body = bodies.get(op.target)
+  if (body === undefined) throw new Error(`unknown body: ${op.target}`)
+  const views = Array.isArray(op.views) && op.views.length > 0 ? op.views : DEFAULT_DRAWING_VIEWS
+  // The cadorange backend HLRs through its own kernel session (the escape
+  // hatch) — no STEP export/re-import and no second wasm instance.
+  if (typeof adapter.hiddenLineViewsOf === 'function') {
+    return { views: adapter.hiddenLineViewsOf(body.shape, views).views }
+  }
+  const bridge = await getOcctBridge()
+  if (bridge === null) {
+    throw new Error('the occt.ts kernel is required for engineering drawings but was not found — install it (npm i occt.ts) or point DSH_OCCTJS_DIST at a dist directory')
+  }
+  const stepBytes = adapter.exportFile(body.shape, 'step')
+  const projected = await bridge.hiddenLineViews(stepBytes, views)
+  return { views: projected.views }
+}
+
+/** Announce readiness and start serving ops. */
+function ready() {
+  parentPort.postMessage({ jobId: 0, ok: true, result: { ready: true, kernel: kernelName } })
+  parentPort.on('message', runMessage)
+}
+
+async function bootCadorange() {
+  const mods = await loadCadorange()
+  if (mods === null) return null
+  await mods.core.init()
+  return createCadorangeAdapter(mods)
+}
+
+async function boot() {
+  const requested = process.env.DSH_CAD_KERNEL
+  if (requested === 'opencascade.js') {
+    throw new Error('the opencascade.js fallback backend was removed in v0.15.1 — the kernel chain is cadorange → occt.ts; unset DSH_CAD_KERNEL or use cadorange / occt.ts')
+  }
+  if (requested === 'cadorange') {
+    // Explicit opt-in: cadorange or bust — a clear error beats a silent
+    // fallback when a specific backend was requested.
+    try {
+      adapter = await bootCadorange()
+    } catch (error) {
+      // Name the backend in the failure — the package's own message doesn't.
+      throw new Error(`cadorange init failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    if (adapter === null) {
+      throw new Error('cadorange is not resolvable — set DSH_CADORANGE to its package root, npm i cadorange, or check out cadorange next to this repo')
+    }
+    kernelName = 'cadorange'
+    ready()
+    return
+  }
+  if (requested === undefined || requested === '') {
+    // Default chain: cadorange (the agent-native runtime over the occt.ts
+    // wasm) -> direct occt.ts. A cadorange boot
+    // failure degrades LOUDLY to the next tier — the warning names both.
+    try {
+      adapter = await bootCadorange()
+    } catch (error) {
+      console.warn(`[dsh-cad] cadorange backend failed to boot (${error instanceof Error ? error.message : String(error)}) — falling back to the direct occt.ts backend`)
+    }
+    if (adapter !== null) {
+      kernelName = 'cadorange'
+      ready()
+      return
+    }
+  }
+  const mod = await loadSharedOcctModule()
+  if (mod === null) {
+    throw new Error('no modeling kernel available: cadorange failed to boot and the direct occt.ts backend is unavailable — reinstall dsh-cad (npm i occt.ts) or point DSH_OCCTJS_DIST at an occt.ts dist directory')
+  }
+  adapter = createOcctTsAdapter(mod)
+  kernelName = 'occt.ts'
+  ready()
+}
+
+async function runMessage(message) {
+  {
+    const transfers = []
+    try {
+      const result = await applyOp(message.op)
+      const collect = (mesh) => {
+        if (mesh === undefined) return
+        transfers.push(mesh.positions.buffer, mesh.indices.buffer, mesh.normals.buffer)
+      }
+      if (result.mesh !== undefined) collect(result.mesh)
+      for (const mesh of result.meshes ?? []) collect(mesh)
+      if (result.created !== undefined) for (const entry of result.created) if (entry.mesh !== undefined) collect(entry.mesh)
+      if (result.bytes !== undefined) transfers.push(result.bytes)
+      parentPort.postMessage({ jobId: message.jobId, ok: true, result }, transfers)
+    } catch (error) {
+      parentPort.postMessage({
+        jobId: message.jobId,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+}
+
+boot().catch((error) => {
+  parentPort.postMessage({ jobId: 0, ok: false, error: `modeling kernel init failed: ${error instanceof Error ? error.message : String(error)}` })
+})
+

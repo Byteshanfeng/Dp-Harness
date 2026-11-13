@@ -1,0 +1,153 @@
+# Keep third-party client modules selected while their Host tools belong to the architecture preset.
+- id: dsh-cad
+  disabled: true
+- id: dsh-blender-plugin
+  disabled: true
+- insert:
+    - id: preset-architecture
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: architecture
+        name: 建筑设计
+        description: 使用 IFC、CAD 和 Blender 工具处理建筑与工程设计任务。
+        order: 10
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |
+                你是面向专业建筑设计工程师的建筑与工程设计助理，由 {{model}} 模型驱动。开始任务前确认项目目标、场地、尺度、单位、坐标系、专业范围和交付物，并以工程师提供的设计依据为准；未知的单位或坐标系不能推断为已知。
+                审查 IFC 时，先用 architecture_stage_file 将工作区内的 IFC 复制到当前会话，使用返回的路径和明确且唯一的 model_id 加载模型，再确认单位、楼层、构件数量及模型读取警告；按任务运行 model_audit、clash_check 或 clash_matrix。收到 IDS 文件后也先暂存，再运行 ids_audit、ids_lint，确认信息要求后用 ids_validate 校验模型；没有相应依据时在报告中写「未检查」，不能写「通过」。IDS 校验不等于几何、退界或法规审查。
+                发现问题时记录构件 GlobalId、楼层、规则、严重程度和证据；可用 BCF topic 与 viewpoint 保存问题，并导出 BCF。几何碰撞结果需由设计师复核，不把自动检查当作设计或法规合规结论。
+                修改模型前列出拟修改的构件、属性或几何、预期影响和输出文件名，等待设计师明确确认；IFClite、CAD 和 Blender 的修改工具执行还需要审批。所有 IFClite 输出与 CAD 导出写入本会话 outputs 目录中的新文件，不能覆盖原始 IFC 或旧版本。修改后导出新的 IFC，使用新的 model_id 加载导出文件，重新运行模型审计与碰撞检查，并用 model_diff、quantity_diff 核对差异；待提交修改的旧网格不能作为修改后的碰撞结果。核对后调用 architecture_record_version 保存 IFC 与 BCF 成果，无方案简报时省略 brief_id。
+                方案设计先核实项目名称、用地面积及来源、矩形建筑长宽、层数和层高；收到 DXF 时先暂存，用 architecture_inspect_dxf_units 检查声明的单位，并用 cad_info 检查图层、范围和实体数量，坐标系未知或单位不明确时请设计师确认，不从外接框推断用地面积。用 architecture_project_brief 记录条件与初步指标；缺少面积来源时停止用地指标计算。用 architecture_generate_scheme 从简报生成 DXF 平面轮廓和 OBJ 体量，使用 cad_info 或 cad_view 核对成果后调用 architecture_record_version 保存新版本，修订时传入父版本，并用 architecture_compare_versions 核对输入和指标差异。DXF 采用毫米，OBJ 采用米；容积率、覆盖率等只是明确假设下的几何估算，不是规划许可或法规合规结论。
+                生成中文 Markdown 检查或方案报告，写明输入文件及来源、模型 ID、单位与坐标系、检查范围、规则与阈值、指标公式和假设、发现的问题及 GlobalId、修改前后差异、未执行或失败的检查、成果及版本清单路径。报告只引用实际工具结果；未取得结果时明确说明。确认交付版本后使用 present 把该版本目录中的成果与清单交给用户；使用 IFC、CAD 或 Blender 工具时说明文件位置与验证结果。
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              # Set false to drop the apply_patch tool beside edit.
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                    Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+                    The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+                    Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+                    Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelection: true
+                  modelDiscovery: true
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+              - id: workflow-ptc
+                name: '@deepseek-ai/dsh-workflow-ptc'
+                config:
+                  provider: spawn
+              - id: tool-workflow
+                name: '@deepseek-ai/dsh-tool-workflow'
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+          - id: tool-plugin-manager
+            name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: !!js "!ctx.get('profileContext')"
+          - id: tool-plugin-market
+            name: '@deepseek-ai/dsh-plugin-market/tools'
+            disabled: true
+          - id: architecture-workspace
+            name: dsh-architecture-bundle
+            config:
+              root: !!js "process.env.DSH_ARCH_WORKSPACE ?? process.getBuiltinModule('node:path').join(ctx.get('profileContext').home, 'architecture-design')"
+              toolSet: !!js "process.env.DSH_ARCH_IFCLITE_TOOL_SET ?? 'review'"
+          - id: architecture-cad
+            name: dsh-cad
+            config:
+              root: !!js "process.env.DSH_ARCH_WORKSPACE ?? process.getBuiltinModule('node:path').join(ctx.get('profileContext').home, 'architecture-design')"
+          - id: architecture-blender
+            name: dsh-blender-plugin
+            config:
+              autoStart: false

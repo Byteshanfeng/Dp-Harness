@@ -678,8 +678,10 @@ export class SessionManager {
   }
 
   /**
-   * Apply one Session removal forwarded through `ctx.remote.$on`.
-   * @param sessionId - removed Session identity.
+   * Apply one resident Session removal forwarded through `ctx.remote.$on`.
+   * A disposed resident Session can still have a persisted row; reconcile the
+   * list after any in-flight pull settles so that row returns if it remains stored.
+   * @param sessionId - removed resident Session identity.
    */
   handleSessionRemoved(sessionId: SessionId): void {
     const durableSubagent = this.subagentAddress(sessionId) !== undefined
@@ -697,6 +699,15 @@ export class SessionManager {
     this.projectionInflight.get(sessionId)?.controller.abort()
     this.projectionInflight.delete(sessionId)
     this.projectionLoads.delete(sessionId)
+    if (!durableSubagent) {
+      const inFlight = this.listInflight
+      void (async () => {
+        if (inFlight !== null) await Promise.allSettled([inFlight])
+        if (!this.disposed) await this.refreshList()
+      })().catch((error: unknown) => {
+        if (!this.disposed) console.error('[session-controller] list refresh after Session removal failed:', error)
+      })
+    }
   }
 
   /**

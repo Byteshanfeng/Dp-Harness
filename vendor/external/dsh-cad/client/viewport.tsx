@@ -1,0 +1,450 @@
+/**
+ * Shared viewport components + scene fetching for the chat card and the
+ * resident details-panel viewer, plus the "latest CAD scene" memory that keeps
+ * the right-side panel showing the most recent model even while another tool
+ * call is selected.
+ */
+import React from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { CadScene, CadViewMeta } from './scene-types.js'
+import { mountViewer3D } from './viewer3d.js'
+import type { LiveViewer3DHandle, RenderMode } from './viewer3d.js'
+import { entityNodes, fitViewBox } from './viewer2d.js'
+import type { ViewBox } from './viewer2d.js'
+import { cadCanvasBackground, cadPaperColor, useCadTheme } from './theme.js'
+import type { CadTheme } from './theme.js'
+
+/** Render-mode cycle order + button labels (shared by editor and cards). */
+export const RENDER_MODES: RenderMode[] = ['shaded-edges', 'shaded', 'wireframe']
+export const RENDER_MODE_LABELS: Record<RenderMode, string> = {
+  'shaded-edges': 'Faces+Edges',
+  shaded: 'Faces',
+  wireframe: 'Wireframe',
+}
+
+// ── latest-CAD memory ───────────────────────────────────────────────────────
+
+/** The panel tab a result belongs to (mirrors CadViewMeta.doc). */
+export type DocKind = 'part' | 'assembly' | 'drawing'
+
+let latest: { meta: CadViewMeta; at: number } | null = null
+const latestListeners = new Set<() => void>()
+/** Newest result per panel tab kind (assembly/drawing tabs track these). */
+const latestByKind: Record<DocKind, { meta: CadViewMeta; at: number } | null> = {
+  part: null,
+  assembly: null,
+  drawing: null,
+}
+
+/** Record the freshest CAD result (called whenever a CAD card settles). */
+export function rememberLatest(meta: CadViewMeta): void {
+  latest = { meta, at: Date.now() }
+  const kind: DocKind = meta.doc ?? 'part'
+  latestByKind[kind] = { meta, at: Date.now() }
+  for (const listener of latestListeners) listener()
+}
+
+/** The freshest CAD result, if any tool has produced one. */
+export function readLatest(): { meta: CadViewMeta; at: number } | null {
+  return latest
+}
+
+/** The freshest result for one panel tab kind. */
+export function readKind(kind: DocKind): { meta: CadViewMeta; at: number } | null {
+  return latestByKind[kind]
+}
+
+/**
+ * Subscribe to latest-CAD changes (the resident tabs re-render through this
+ * so a finished model appears without leaving the tab).
+ */
+export function subscribeLatest(listener: () => void): () => void {
+  latestListeners.add(listener)
+  return () => {
+    latestListeners.delete(listener)
+  }
+}
+
+// ── scene fetching ───────────────────────────────────────────────────────────
+
+/** Read a block's CAD presentation metadata, or null when it is not CAD. */
+export function readMeta(block: { meta?: unknown }): CadViewMeta | null {
+  const meta = block.meta
+  if (meta === null || typeof meta !== 'object') return null
+  const candidate = meta as Partial<CadViewMeta>
+  return typeof candidate.viewId === 'string' && (candidate.kind === '3d' || candidate.kind === '2d')
+    ? (candidate as CadViewMeta)
+    : null
+}
+
+/** Decoded binary scene — the same shape viewer3d consumes as CadScene3D. */
+export interface BinaryScene3D {
+  kind: '3d'
+  format: string
+  meshes: Array<{ name: string; color?: number; mode?: 'wire' | 'fill' | 'points'; positions: Float32Array; normals?: Float32Array; indices: Uint32Array; vertexCount: number; triangleCount: number }>
+  bounds: { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } }
+  units: string
+}
+
+interface BinMeshDesc2 {
+  name: string
+  color?: number
+  mode?: 'wire' | 'fill' | 'points'
+  vertexCount: number
+  triangleCount: number
+  posOffset: number
+  posBytes: number
+  nrmOffset?: number
+  nrmBytes?: number
+  idxOffset: number
+  idxBytes: number
+}
+
+/** Decode the packed binary scene (header JSON + raw f32/u32 payloads). */
+export function decodeBinaryScene(buffer: ArrayBuffer): BinaryScene3D {
+  const view = new DataView(buffer)
+  const magic = view.getUint32(0, true)
+  if (magic !== 0x31424344) throw new Error('bad scene magic')
+  const headerLength = view.getUint32(4, true)
+  // The header length is padded to 8 bytes; strip the NUL padding before JSON.
+  const headerText = new TextDecoder().decode(new Uint8Array(buffer, 8, headerLength)).replace(/\u0000+$/, '')
+  const header = JSON.parse(headerText) as {
+    meshes: BinMeshDesc2[]
+    bounds: { min: [number, number, number]; max: [number, number, number] }
+    units: string
+  }
+  const payloadStart = 8 + headerLength
+  const meshes = header.meshes.map((desc) => ({
+    name: desc.name,
+    ...(desc.color === undefined ? {} : { color: desc.color }),
+    ...(desc.mode === undefined ? {} : { mode: desc.mode }),
+    positions: new Float32Array(buffer, payloadStart + desc.posOffset, desc.posBytes / 4),
+    ...(desc.nrmOffset === undefined ? {} : { normals: new Float32Array(buffer, payloadStart + desc.nrmOffset, (desc.nrmBytes ?? 0) / 4) }),
+    indices: new Uint32Array(buffer, payloadStart + desc.idxOffset, desc.idxBytes / 4),
+    vertexCount: desc.vertexCount,
+    triangleCount: desc.triangleCount,
+  }))
+  return {
+    kind: '3d',
+    format: 'model',
+    meshes,
+    bounds: {
+      min: { x: header.bounds.min[0], y: header.bounds.min[1], z: header.bounds.min[2] },
+      max: { x: header.bounds.max[0], y: header.bounds.max[1], z: header.bounds.max[2] },
+    },
+    units: header.units,
+  }
+}
+
+export interface SceneState {
+  scene: CadScene | BinaryScene3D | null
+  error: string | null
+}
+
+/** Fetch a scene JSON by URL (re-fetches when the URL changes). The previous
+ *  scene stays visible while re-fetching (stale-while-revalidate) — dropping
+ *  to null would tear down and rebuild the whole viewer. */
+export function useScene(sceneUrl: string | undefined): SceneState {
+  const [scene, setScene] = useState<CadScene | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (sceneUrl === undefined) return
+    let cancelled = false
+    setError(null)
+    const isBinary = sceneUrl.includes('/dsh-cad/bin/')
+    fetch(sceneUrl)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`scene fetch failed: HTTP ${response.status}`)
+        if (isBinary) return decodeBinaryScene(await response.arrayBuffer()) as CadScene | BinaryScene3D
+        return (await response.json()) as CadScene
+      })
+      .then((loaded) => {
+        if (!cancelled) setScene(loaded)
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause))
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [sceneUrl])
+
+  return { scene, error }
+}
+
+// ── viewports ────────────────────────────────────────────────────────────────
+
+/**
+ * Sizing modes: a fixed `height` (chat cards) or `fill` — the wrapper joins the
+ * parent's flex column and the canvas tracks the flexed box (resident side
+ * panel). `fill` parents must be a definite-height flex column.
+ */
+export interface ViewportSizing {
+  height?: number | string
+  fill?: boolean
+  /** Mesh name to emissive-highlight (assembly tree selection). */
+  highlight?: string | null
+  /** Mesh names not drawn (assembly tree eye toggles). */
+  hidden?: readonly string[]
+}
+
+export function Viewport({ scene, error, height, fill, lazy, highlight, hidden }: SceneState & ViewportSizing & { lazy?: boolean }): JSX.Element {
+  // The last good scene wins over a failed re-fetch: a transient error must
+  // not blank the viewer that is already displaying a model.
+  if (scene !== null) {
+    if (scene.kind === '3d') return <Viewport3D scene={scene} height={height} fill={fill} lazy={lazy} highlight={highlight} hidden={hidden} />
+    return <Viewport2D scene={scene} height={height} fill={fill} />
+  }
+  if (error !== null) return <div style={styles.error}>{error}</div>
+  return <div style={styles.placeholder}>loading…</div>
+}
+
+/** The sized viewport slab for the current theme (fixed height or flex fill). */
+function surfaceStyle(fill: boolean | undefined, height: number | string | undefined, theme: CadTheme): React.CSSProperties {
+  return {
+    ...(fill === true ? fillStyles.viewport : { ...styles.viewport, height: height ?? 360 }),
+    background: cadCanvasBackground(theme),
+  }
+}
+
+function Viewport3D({ scene, height, fill, lazy, highlight, hidden }: { scene: Extract<CadScene, { kind: '3d' }> } & ViewportSizing & { lazy?: boolean }): JSX.Element {
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const handleRef = useRef<LiveViewer3DHandle | null>(null)
+  const [renderMode, setRenderMode] = useState<RenderMode>('shaded-edges')
+  const theme = useCadTheme()
+  // Tracks what the handle already displays: the mount effect loads the
+  // initial scene, so the first run of the update effect must not re-apply it.
+  const appliedRef = useRef(scene)
+  // Self-heal generation: a lost WebGL context (browser context budget / GPU
+  // reset) permanently blanks the persistent canvas — bumping this tears the
+  // viewer down and remounts a fresh one. Rate-limited so a page over the
+  // browser's context budget cannot remount in a tight loop.
+  const [generation, setGeneration] = useState(0)
+  const lastHealRef = useRef(0)
+  // Lazy viewers mount only while near the viewport: every viewer holds two
+  // WebGL contexts (canvas + ViewCube) and browsers evict the OLDEST context
+  // past ~16 — with every chat card holding contexts forever, the persistent
+  // side-panel viewer would always be the first victim.
+  const [visible, setVisible] = useState(lazy !== true)
+
+  useEffect(() => {
+    if (lazy !== true) return
+    const container = containerRef.current
+    if (container === null) return
+    const observer = new IntersectionObserver((entries) => {
+      setVisible(entries[0]?.isIntersecting ?? true)
+    }, { rootMargin: '200px' })
+    observer.observe(container)
+    return () => {
+      observer.disconnect()
+    }
+  }, [lazy])
+
+  useEffect(() => {
+    if (!visible) return
+    const container = containerRef.current
+    if (container === null) return
+    const handle = mountViewer3D(container, appliedRef.current)
+    handleRef.current = handle
+    handle.setRenderMode(renderMode)
+    const onContextLost = (): void => {
+      const now = Date.now()
+      if (now - lastHealRef.current < 1000) return
+      lastHealRef.current = now
+      setGeneration((previous) => previous + 1)
+    }
+    handle.domElement.addEventListener('webglcontextlost', onContextLost)
+    return () => {
+      handle.domElement.removeEventListener('webglcontextlost', onContextLost)
+      handle.dispose()
+      handleRef.current = null
+    }
+    // Mount-once per visibility/generation: later scenes swap geometry in
+    // place through the effect below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible, generation])
+
+  useEffect(() => {
+    if (scene === appliedRef.current) return
+    appliedRef.current = scene
+    handleRef.current?.setScene(scene)
+  }, [scene])
+
+  useEffect(() => {
+    handleRef.current?.setRenderMode(renderMode)
+  }, [renderMode])
+
+  useEffect(() => {
+    handleRef.current?.highlightMesh(highlight ?? null)
+  }, [highlight])
+
+  useEffect(() => {
+    handleRef.current?.setHiddenMeshes(hidden ?? [])
+  }, [hidden])
+
+  const cycleRenderMode = useCallback(() => {
+    setRenderMode((previous) => RENDER_MODES[(RENDER_MODES.indexOf(previous) + 1) % RENDER_MODES.length])
+  }, [])
+
+  const resetView = useCallback(() => {
+    handleRef.current?.resetView()
+  }, [])
+
+  return (
+    <div style={fill === true ? fillStyles.wrap : styles.viewportWrap}>
+      <div ref={containerRef} style={surfaceStyle(fill, height, theme)} />
+      <div style={styles.toolbar}>
+        <button type="button" style={styles.button} onClick={cycleRenderMode} aria-pressed={renderMode === 'wireframe'}>
+          {RENDER_MODE_LABELS[renderMode]}
+        </button>
+        <button type="button" style={styles.button} onClick={resetView}>
+          Reset view
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function Viewport2D({ scene, height, fill }: { scene: Extract<CadScene, { kind: '2d' }> } & ViewportSizing): JSX.Element {
+  const [viewBox, setViewBox] = useState<ViewBox>(() => fitViewBox(scene))
+  const dragRef = useRef<{ x: number; y: number; viewBox: ViewBox } | null>(null)
+  const fit = useCallback(() => setViewBox(fitViewBox(scene)), [scene])
+  const theme = useCadTheme()
+
+  const onWheel = useCallback((event: React.WheelEvent<SVGSVGElement>) => {
+    event.preventDefault()
+    const svg = event.currentTarget
+    const rect = svg.getBoundingClientRect()
+    const cursorX = viewBox.x + ((event.clientX - rect.left) / rect.width) * viewBox.width
+    const cursorY = viewBox.y + ((event.clientY - rect.top) / rect.height) * viewBox.height
+    const zoom = event.deltaY < 0 ? 0.85 : 1.18
+    setViewBox({
+      x: cursorX - (cursorX - viewBox.x) * zoom,
+      y: cursorY - (cursorY - viewBox.y) * zoom,
+      width: viewBox.width * zoom,
+      height: viewBox.height * zoom,
+    })
+  }, [viewBox])
+
+  const onPointerDown = useCallback((event: React.PointerEvent<SVGSVGElement>) => {
+    dragRef.current = { x: event.clientX, y: event.clientY, viewBox }
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }, [viewBox])
+
+  const onPointerMove = useCallback((event: React.PointerEvent<SVGSVGElement>) => {
+    const drag = dragRef.current
+    if (drag === null) return
+    const svg = event.currentTarget
+    const rect = svg.getBoundingClientRect()
+    const scaleX = drag.viewBox.width / rect.width
+    const scaleY = drag.viewBox.height / rect.height
+    setViewBox({
+      ...drag.viewBox,
+      x: drag.viewBox.x - (event.clientX - drag.x) * scaleX,
+      y: drag.viewBox.y - (event.clientY - drag.y) * scaleY,
+    })
+  }, [])
+
+  const onPointerUp = useCallback(() => {
+    dragRef.current = null
+  }, [])
+
+  if (scene.format === 'svg' && scene.svgText !== undefined) {
+    const dataUrl = `data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(scene.svgText)))}`
+    return (
+      <div style={fill === true ? fillStyles.wrap : styles.viewportWrap}>
+        {/* A drawing is paper: keep the sheet light, but frame it on the
+            themed slab so it reads as a sheet instead of a light viewport. */}
+        <div style={{ ...surfaceStyle(fill, height, theme), display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 12, boxSizing: 'border-box' }}>
+          <img
+            src={dataUrl}
+            alt={scene.format}
+            style={{
+              maxWidth: '100%',
+              maxHeight: '100%',
+              background: cadPaperColor(theme),
+              borderRadius: 2,
+              boxShadow: '0 1px 2px rgba(16,24,40,0.18), 0 12px 30px -16px rgba(16,24,40,0.45)',
+            }}
+          />
+        </div>
+        <div style={styles.toolbar} />
+      </div>
+    )
+  }
+
+  return (
+    <div style={fill === true ? fillStyles.wrap : styles.viewportWrap}>
+      <svg
+        viewBox={`${viewBox.x} ${viewBox.y} ${viewBox.width} ${viewBox.height}`}
+        style={{ ...surfaceStyle(fill, height, theme), cursor: dragRef.current === null ? 'default' : 'grabbing', touchAction: 'none' }}
+        onWheel={onWheel}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerLeave={onPointerUp}
+      >
+        <g transform="scale(1 -1)">{entityNodes(scene, theme)}</g>
+      </svg>
+      <div style={styles.toolbar}>
+        <button type="button" style={styles.button} onClick={fit}>
+          Fit
+        </button>
+      </div>
+    </div>
+  )
+}
+
+export const styles: Record<string, React.CSSProperties> = {
+  viewportWrap: { position: 'relative' },
+  viewport: {
+    width: '100%',
+    display: 'block',
+  },
+  toolbar: {
+    position: 'absolute',
+    top: 8,
+    left: 8,
+    display: 'flex',
+    gap: 6,
+    zIndex: 5,
+  },
+  button: {
+    border: '1px solid var(--dsw-alias-border-l2, #c4c9d0)',
+    borderRadius: 999,
+    background: 'var(--dsw-alias-bg-base, #fff)',
+    color: 'var(--dsw-alias-label-secondary, #374151)',
+    fontSize: 11,
+    lineHeight: '16px',
+    padding: '3px 10px',
+    cursor: 'pointer',
+  },
+  placeholder: {
+    color: 'var(--dsw-alias-label-tertiary, #6b7280)',
+    fontSize: 12,
+    padding: '10px 12px',
+  },
+  error: {
+    color: 'var(--dsw-alias-state-error-primary, #b91c1c)',
+    fontSize: 12,
+    padding: '10px 12px',
+  },
+}
+
+/** Fill-mode twins of the viewport styles (see {@link ViewportSizing}). */
+const fillStyles: Record<string, React.CSSProperties> = {
+  wrap: {
+    position: 'relative',
+    flex: '1 1 auto',
+    minHeight: 0,
+    display: 'flex',
+    flexDirection: 'column',
+  },
+  viewport: {
+    flex: '1 1 auto',
+    minHeight: 0,
+    width: '100%',
+    display: 'block',
+  },
+}

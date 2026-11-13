@@ -1,0 +1,1193 @@
+/**
+ * The resident CAD display panel — a host-rightbar PANE (the sidebar-right
+ * tab system, dsh ≥0.2.x): a tab strip with closable tabs and a "+" menu
+ * offering three document kinds — 零件 (Part Studio, the default), 装配体
+ * (Assembly), 工程图 (Drawing). Width, collapse, float, fullscreen, and the
+ * per-session open state all belong to the host's docking kit — this module
+ * carries only the content.
+ *
+ * Tabs are singletons per kind (Onshape-style document structure, minimal
+ * chrome): the "+" menu activates the existing tab or creates it. Tab state
+ * lives in a module store so remounts never lose it.
+ */
+import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import type { CadViewMeta } from './scene-types.js'
+import { mountCadEditor3D } from './viewer3d.js'
+import { useScene, Viewport } from './viewport.js'
+import { sceneVersion, setPollSession, useActiveDoc, useDocVersion, withDocVersion } from './doc-revision.js'
+import type { DocKind } from './viewport.js'
+import { AssemblyTree, useAssemblyTree } from './assembly-tree.js'
+import { FeatureTree, useFeatureTree } from './feature-tree.js'
+import { cadCanvasBackground, useCadTheme } from './theme.js'
+
+// ── harness services (structural, defensive) ────────────────────────────────
+
+/**
+ * The slice of `ctx.sessions` the panel needs: resolving the current session's
+ * conversation observable. Structural so a missing service degrades to the
+ * latest-memory fallback instead of throwing.
+ */
+export interface SessionsLike {
+  binding?(id: string): { session: { getSnapshot(): unknown; subscribe(fn: () => void): () => void } } | undefined
+}
+
+/** The host's observable selection of the current session. */
+export interface CurrentSessionLike {
+  getSnapshot(): { key?: unknown }
+  subscribe(fn: () => void): () => void
+}
+
+/** Root-scope standard kit: the useSessions selector hook arrives as a prop. */
+export interface CadSidePanelProps {
+  useSessions?: <S>(selector: (state: { current?: string }) => S) => S
+}
+
+/**
+ * What the `sidebar.right.pane.tab` keyed seat passes a tab body (structural:
+ * useTabInfo/sessionId/store/inject extras are ignored; only the sessions
+ * selector hook is consumed, and it too is optional — the sessions service
+ * closure is the fallback channel).
+ */
+export interface CadPaneSeatProps {
+  useSessions?: <S>(selector: (state: { current?: string }) => S) => S
+  [extra: string]: unknown
+}
+
+/** Newest CAD presentation meta per panel tab kind in a conversation snapshot. */
+function scanNewestCadMetas(snapshot: unknown): Record<DocKind, CadViewMeta | undefined> {
+  const empty: Record<DocKind, CadViewMeta | undefined> = { part: undefined, assembly: undefined, drawing: undefined }
+  const nodes = (snapshot as { nodes?: Array<Record<string, unknown>> } | null)?.nodes ?? []
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const node = nodes[i]
+    if (node === undefined) continue
+    const meta = node.meta as Partial<CadViewMeta> | null | undefined
+    if (node.kind === 'tool-result' && typeof meta?.viewId === 'string' && (meta.kind === '3d' || meta.kind === '2d')) {
+      const kind: DocKind = meta.doc ?? 'part'
+      if (empty[kind] === undefined) empty[kind] = meta as CadViewMeta
+    }
+  }
+  return empty
+}
+
+const noopSubscribe = (): (() => void) => () => {}
+
+const EMPTY_METAS: Record<DocKind, CadViewMeta | undefined> = { part: undefined, assembly: undefined, drawing: undefined }
+
+/** Stable-snapshot cache: useSyncExternalStore forbids fresh objects per call. */
+let lastScanned: Record<DocKind, CadViewMeta | undefined> = EMPTY_METAS
+
+/** The freshest CAD meta per tab kind of the current session. */
+function useKindMetas(current: string | null, sessions: SessionsLike | undefined): Record<DocKind, CadViewMeta | null> {
+  const face = useMemo(() => {
+    if (sessions === undefined || current === null) return undefined
+    return sessions.binding?.(current)?.session
+  }, [sessions, current])
+
+  const subscribe = useMemo(() => {
+    if (face === undefined) return noopSubscribe
+    return (onChange: () => void): (() => void) => face.subscribe(onChange)
+  }, [face])
+  const getMetas = useMemo(() => {
+    if (face === undefined) return (): Record<DocKind, CadViewMeta | undefined> => EMPTY_METAS
+    return (): Record<DocKind, CadViewMeta | undefined> => {
+      const next = scanNewestCadMetas(face.getSnapshot())
+      if (lastScanned !== EMPTY_METAS && lastScanned.part === next.part && lastScanned.assembly === next.assembly && lastScanned.drawing === next.drawing) {
+        return lastScanned
+      }
+      lastScanned = next
+      return next
+    }
+  }, [face])
+  const sessionMetas = useSyncExternalStore(subscribe, getMetas)
+
+  return {
+    part: sessionMetas.part ?? null,
+    assembly: sessionMetas.assembly ?? null,
+    drawing: sessionMetas.drawing ?? null,
+  }
+}
+
+// ── tab store (module level: survives collapse/expand and remounts) ─────────
+
+interface PanelTab {
+  id: DocKind
+}
+
+const TAB_TITLES: Record<DocKind, string> = {
+  part: 'Part Studio',
+  assembly: '装配体',
+  drawing: '工程图',
+}
+
+let tabsState: PanelTab[] = [{ id: 'part' }]
+let activeTab: DocKind | null = 'part'
+/**
+ * Cached snapshot for useSyncExternalStore: getSnapshot must return a stable
+ * reference until the store actually changes, or React re-renders forever
+ * (error #185, surfaced by the entry-crash supervision).
+ */
+let tabsSnapshot: { tabs: PanelTab[]; active: DocKind | null } = { tabs: tabsState, active: activeTab }
+const tabListeners = new Set<() => void>()
+
+function emitTabs(): void {
+  tabsSnapshot = { tabs: tabsState, active: activeTab }
+  for (const listener of tabListeners) listener()
+}
+
+function ensureTab(kind: DocKind): void {
+  if (!tabsState.some((tab) => tab.id === kind)) {
+    tabsState = [...tabsState, { id: kind }]
+  }
+  activeTab = kind
+  emitTabs()
+}
+
+function closeTab(kind: DocKind): void {
+  const index = tabsState.findIndex((tab) => tab.id === kind)
+  if (index === -1) return
+  tabsState = tabsState.filter((tab) => tab.id !== kind)
+  if (activeTab === kind) {
+    const next = tabsState[index - 1] ?? tabsState[index]
+    activeTab = next?.id ?? null
+  }
+  emitTabs()
+}
+
+function activateTab(kind: DocKind): void {
+  activeTab = kind
+  emitTabs()
+}
+
+function useTabs(): { tabs: PanelTab[]; active: DocKind | null } {
+  return useSyncExternalStore(
+    (onChange) => {
+      tabListeners.add(onChange)
+      return () => {
+        tabListeners.delete(onChange)
+      }
+    },
+    () => tabsSnapshot,
+    () => tabsSnapshot,
+  )
+}
+
+// ── preview document store (module level, same pattern as the tab store) ────
+
+/** A document picked from the file list, previewed in the Part tab. */
+interface PreviewDoc {
+  sessionId: string | null
+  docId: string
+  name: string
+  sceneUrl: string
+}
+
+let previewDocState: PreviewDoc | null = null
+let previewSnapshot: PreviewDoc | null = previewDocState
+const previewListeners = new Set<() => void>()
+
+function setPreviewDoc(next: PreviewDoc | null): void {
+  previewDocState = next
+  previewSnapshot = next
+  for (const listener of previewListeners) listener()
+}
+
+function usePreviewDoc(sessionId: string | null): PreviewDoc | null {
+  const preview = useSyncExternalStore(
+    (onChange) => {
+      previewListeners.add(onChange)
+      return () => {
+        previewListeners.delete(onChange)
+      }
+    },
+    () => previewSnapshot,
+    () => previewSnapshot,
+  )
+  return preview?.sessionId === sessionId ? preview : null
+}
+
+// ── icons (inline SVG, 14px) ─────────────────────────────────────────────────
+
+const ICON_STROKE = 'currentColor'
+
+function PartIcon(): JSX.Element {
+  return (
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden>
+      <path d="M8 1.5 14 5v6L8 14.5 2 11V5l6-3.5Z" stroke={ICON_STROKE} strokeWidth="1.3" strokeLinejoin="round" />
+      <path d="M2 5l6 3.5L14 5M8 8.5v6" stroke={ICON_STROKE} strokeWidth="1.3" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function AssemblyIcon(): JSX.Element {
+  return (
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden>
+      <path d="M5.5 1.5 10 4v4L5.5 10.5 1 8V4l4.5-2.5Z" stroke={ICON_STROKE} strokeWidth="1.2" strokeLinejoin="round" opacity="0.75" />
+      <path d="M10.5 5.5 15 8v4l-4.5 2.5L6 12V8l4.5-2.5Z" stroke={ICON_STROKE} strokeWidth="1.2" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function DrawingIcon(): JSX.Element {
+  return (
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden>
+      <path d="M3 1.5h7l3 3V14.5H3V1.5Z" stroke={ICON_STROKE} strokeWidth="1.3" strokeLinejoin="round" />
+      <path d="M5.5 7h5M5.5 9.5h5M5.5 12h3" stroke={ICON_STROKE} strokeWidth="1.2" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function TabIcon({ kind }: { kind: DocKind }): JSX.Element {
+  if (kind === 'assembly') return <AssemblyIcon />
+  if (kind === 'drawing') return <DrawingIcon />
+  return <PartIcon />
+}
+
+/** Folder glyph for the file-space (document list) button. */
+function FolderIcon(): JSX.Element {
+  return (
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden>
+      <path d="M1.5 4.5A1 1 0 0 1 2.5 3.5h3.2l1.4 1.8h6.4a1 1 0 0 1 1 1v6.2a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1V4.5Z" stroke={ICON_STROKE} strokeWidth="1.3" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+/** Document glyph for file-list rows. */
+function DocIcon(): JSX.Element {
+  return (
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden>
+      <path d="M4 1.5h5l3 3v10H4v-13Z" stroke={ICON_STROKE} strokeWidth="1.2" strokeLinejoin="round" />
+      <path d="M9 1.5v3h3" stroke={ICON_STROKE} strokeWidth="1.2" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+
+const MENU_ITEMS: Array<{ kind: DocKind; label: string; hint: string }> = [
+  { kind: 'part', label: '零件', hint: 'Part Studio · 三维建模' },
+  { kind: 'assembly', label: '装配体', hint: 'Assembly · 实例装配' },
+  { kind: 'drawing', label: '工程图', hint: 'Drawing · 图纸输出' },
+]
+
+function NewTabMenu({ onPick, onClose }: { onPick: (kind: DocKind) => void; onClose: () => void }): JSX.Element {
+  const ref = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    const onPointerDown = (event: PointerEvent): void => {
+      if (ref.current !== null && event.target instanceof Node && ref.current.contains(event.target)) return
+      onClose()
+    }
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') onClose()
+    }
+    document.addEventListener('pointerdown', onPointerDown, true)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown, true)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [onClose])
+
+  return (
+    <div ref={ref} style={panelStyles.menu} role="menu" aria-label="新建文档">
+      {MENU_ITEMS.map((item) => (
+        <button
+          key={item.kind}
+          type="button"
+          role="menuitem"
+          style={panelStyles.menuItem}
+          onClick={() => { onPick(item.kind) }}
+        >
+          <span style={panelStyles.menuIcon}><TabIcon kind={item.kind} /></span>
+          <span style={panelStyles.menuLabel}>{item.label}</span>
+          <span style={panelStyles.menuHint}>{item.hint}</span>
+        </button>
+      ))}
+    </div>
+  )
+}
+
+// ── the file-space (documents) menu ─────────────────────────────────────────
+
+interface DocsEntry {
+  id: string
+  name: string
+  bodies: number
+  updatedAt: string
+  sceneUrl?: string
+}
+
+/** Compact relative time for the file list (刚刚 / 5 分钟前 / 3 天前). */
+function relTime(iso: string): string {
+  const ms = Date.now() - Date.parse(iso)
+  if (!Number.isFinite(ms)) return ''
+  const minutes = Math.floor(ms / 60_000)
+  if (minutes < 1) return '刚刚'
+  if (minutes < 60) return `${minutes} 分钟前`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} 小时前`
+  return `${Math.floor(hours / 24)} 天前`
+}
+
+function DocsMenu({ activeDocId, sessionId, onClose }: { activeDocId: string | null; sessionId: string | null; onClose: () => void }): JSX.Element {
+  const ref = useRef<HTMLDivElement | null>(null)
+  const [entries, setEntries] = useState<DocsEntry[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [confirmingId, setConfirmingId] = useState<string | null>(null)
+  const [busyId, setBusyId] = useState<string | null>(null)
+
+  useEffect(() => {
+    const onPointerDown = (event: PointerEvent): void => {
+      if (ref.current !== null && event.target instanceof Node && ref.current.contains(event.target)) return
+      onClose()
+    }
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') onClose()
+    }
+    document.addEventListener('pointerdown', onPointerDown, true)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown, true)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [onClose])
+
+  const refresh = useCallback((): void => {
+    setEntries(null)
+    setError(null)
+    fetch('/dsh-cad/docs')
+      .then((response) => (response.ok ? (response.json() as Promise<{ docs?: DocsEntry[] }>) : Promise.reject(new Error(`HTTP ${response.status}`))))
+      .then((payload) => { setEntries(payload.docs ?? []) })
+      .catch((cause: unknown) => { setError(cause instanceof Error ? cause.message : String(cause)) })
+  }, [])
+
+  useEffect(() => { refresh() }, [refresh])
+
+  const deleteDoc = (id: string): void => {
+    setBusyId(id)
+    fetch(`/dsh-cad/docs/delete?id=${encodeURIComponent(id)}`, { method: 'POST' })
+      .then(() => {
+        setConfirmingId(null)
+        if (previewSnapshot?.docId === id) setPreviewDoc(null)
+        refresh()
+      })
+      .catch((cause: unknown) => { setError(cause instanceof Error ? cause.message : String(cause)) })
+      .finally(() => { setBusyId(null) })
+  }
+
+  return (
+    <div ref={ref} style={panelStyles.menu} role="menu" aria-label="文档列表">
+      <div style={panelStyles.docsHeader}>工作区文档</div>
+      {error !== null ? <div style={panelStyles.docsError}>{error}</div> : null}
+      {entries === null && error === null ? <div style={panelStyles.docsHintRow}>加载中…</div> : null}
+      {entries !== null && entries.length === 0 ? (
+        <div style={panelStyles.docsHintRow}>还没有建模文档 — 在对话中建模后会出现在这里</div>
+      ) : null}
+      {entries?.map((doc) => {
+        const isActive = doc.id === activeDocId
+        return (
+          <div key={doc.id} style={panelStyles.docRow}>
+            <button
+              type="button"
+              role="menuitem"
+              style={panelStyles.docRowMain}
+              onClick={() => {
+                if (doc.sceneUrl !== undefined) {
+                  setPreviewDoc({ sessionId, docId: doc.id, name: doc.name, sceneUrl: doc.sceneUrl })
+                  ensureTab('part')
+                  onClose()
+                }
+              }}
+              title={doc.sceneUrl === undefined ? '空文档（无场景）' : '点击预览'}
+            >
+              <span style={panelStyles.menuIcon}><DocIcon /></span>
+              <span style={{ ...panelStyles.menuLabel, ...(isActive ? { color: 'var(--dsw-alias-label-primary,#4d6bfe)', fontWeight: 600 } : {}) }}>
+                {doc.name}
+                {isActive ? ' · 当前' : ''}
+              </span>
+              <span style={panelStyles.menuHint}>{doc.bodies} 体 · {relTime(doc.updatedAt)}</span>
+            </button>
+            {confirmingId === doc.id ? (
+              <span style={panelStyles.docConfirm}>
+                <button type="button" style={panelStyles.docConfirmYes} disabled={busyId === doc.id} onClick={() => { deleteDoc(doc.id) }}>
+                  删除
+                </button>
+                <button type="button" style={panelStyles.docConfirmNo} onClick={() => { setConfirmingId(null) }}>
+                  取消
+                </button>
+              </span>
+            ) : (
+              <button
+                type="button"
+                style={panelStyles.docDelete}
+                aria-label={`删除文档 ${doc.name}`}
+                title="删除文档"
+                onClick={() => { setConfirmingId(doc.id) }}
+              >
+                ×
+              </button>
+            )}
+          </div>
+        )
+      })}
+      <div style={panelStyles.docsFooter}>点击预览 · 切换建模目标请在对话中说「打开 xx 文档」</div>
+    </div>
+  )
+}
+
+// ── the panel ────────────────────────────────────────────────────────────────
+
+/**
+ * The panel's content as the host rightbar pane mounts it: the tab strip
+ * (with its "+" and file-list buttons), the overlay menus, and the active
+ * tab's body. No positioning shell here — the pane's tab strip (host chrome)
+ * owns width, collapse, float, and fullscreen.
+ */
+function CadPanelContent(props: {
+  useSessions?: CadSidePanelProps['useSessions']
+  sessions: SessionsLike | undefined
+  currentSession: CurrentSessionLike | undefined
+}): JSX.Element {
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [docsOpen, setDocsOpen] = useState(false)
+  const currentSession = props.currentSession
+  const subscribeCurrent = useCallback((onChange: () => void) => currentSession?.subscribe(onChange) ?? (() => {}), [currentSession])
+  const readCurrent = useCallback(() => currentSession?.getSnapshot().key, [currentSession])
+  const currentKey = useSyncExternalStore(subscribeCurrent, readCurrent)
+  const sessionId = props.useSessions?.((state) => state.current) ?? (typeof currentKey === 'string' ? currentKey : null)
+  const metas = useKindMetas(sessionId, props.sessions)
+  useEffect(() => { setPollSession(sessionId) }, [sessionId])
+  const { tabs, active } = useTabs()
+  const activeMeta = active === null ? null : metas[active]
+
+  return (
+    <>
+      <div style={panelStyles.tabStripRow}>
+        <div style={panelStyles.tabStrip} role="tablist" aria-label="CAD 文档">
+          {tabs.map((tab) => {
+            const isActive = tab.id === active
+            return (
+              <div
+                key={tab.id}
+                role="tab"
+                aria-selected={isActive}
+                tabIndex={0}
+                style={{ ...panelStyles.tab, ...(isActive ? panelStyles.tabActive : {}) }}
+                onClick={() => { activateTab(tab.id) }}
+                onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') activateTab(tab.id) }}
+              >
+                <span style={isActive ? panelStyles.tabIconActive : panelStyles.tabIcon}><TabIcon kind={tab.id} /></span>
+                <span style={panelStyles.tabLabel}>{TAB_TITLES[tab.id]}</span>
+                <button
+                  type="button"
+                  style={panelStyles.tabClose}
+                  aria-label={`关闭 ${TAB_TITLES[tab.id]}`}
+                  title="关闭"
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    closeTab(tab.id)
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+            )
+          })}
+          <button
+            type="button"
+            style={panelStyles.addTab}
+            aria-label="新建文档"
+            title="新建：零件 / 装配体 / 工程图"
+            onClick={() => { setDocsOpen(false); setMenuOpen((open) => !open) }}
+          >
+            +
+          </button>
+        </div>
+        <button
+          type="button"
+          style={panelStyles.fileButton}
+          aria-label="文档列表"
+          aria-expanded={docsOpen}
+          title="工作区文档列表（预览 / 删除）"
+          onClick={() => { setMenuOpen(false); setDocsOpen((open) => !open) }}
+        >
+          <FolderIcon />
+        </button>
+        <span style={panelStyles.headerStats}>{activeMeta === null ? '' : statsLine(activeMeta)}</span>
+      </div>
+      {menuOpen ? (
+        <NewTabMenu
+          onPick={(kind) => {
+            setMenuOpen(false)
+            ensureTab(kind)
+          }}
+          onClose={() => { setMenuOpen(false) }}
+        />
+      ) : null}
+      {docsOpen ? (
+        <DocsMenu
+          activeDocId={metas.part?.viewId ?? null}
+          sessionId={sessionId}
+          onClose={() => { setDocsOpen(false) }}
+        />
+      ) : null}
+      <div style={panelStyles.body}>
+        {active === 'part' ? <PartTabBody meta={metas.part} sessionId={sessionId} /> : null}
+        {active === 'assembly' ? <AssemblyTabBody meta={metas.assembly} /> : null}
+        {active === 'drawing' ? <DrawingTabBody meta={metas.drawing} /> : null}
+      </div>
+    </>
+  )
+}
+
+/**
+ * The host-rightbar-pane body: the same content with no shell of its own —
+ * the pane's tab strip (host chrome) owns width, collapse, float, and
+ * fullscreen, and the session layout remembers the open tab. The seat passes
+ * its own props (useTabInfo, sessionId, useSessions, …); only `useSessions`
+ * is consumed, and the sessions service closure remains the fallback when a
+ * seat build omits it.
+ */
+export function makeCadPaneBody(sessions: SessionsLike | undefined, currentSession?: CurrentSessionLike): (props: CadPaneSeatProps) => JSX.Element {
+  return function CadPaneBody(props: CadPaneSeatProps): JSX.Element {
+    return (
+      <div data-cad-pane="" style={panelStyles.paneRoot}>
+        <CadPanelContent useSessions={props.useSessions} sessions={sessions} currentSession={currentSession} />
+      </div>
+    )
+  }
+}
+
+// ── tab bodies ───────────────────────────────────────────────────────────────
+
+/** 零件 (Part Studio): an empty editor before any model, then live tracking
+ * with the feature tree (sketches + features, eye toggles) floating over it.
+ * A document picked in the file list overrides the tab until the session
+ * produces a new CAD result (auto-return to live tracking). */
+function PartTabBody({ meta, sessionId }: { meta: CadViewMeta | null; sessionId: string | null }): JSX.Element {
+  const preview = usePreviewDoc(sessionId)
+
+  // The part scene's viewId IS the document id; the scene URL's ?v= is the
+  // document version, so the feature tree refetches exactly when the
+  // document changes (any modeling op, cad_sketch_edit included).
+  // Server-side liveness: when the conversation meta pipeline is stale the
+  // polled op count bumps the scene URL anyway, so the viewport follows the
+  // document instead of freezing until a manual file-list reselect. When the
+  // meta points at a different document than the session's binding (doc
+  // switch, cold start), the bound document wins.
+  const bound = useActiveDoc(sessionId)
+  const followBound = bound !== null && bound.sceneUrl !== undefined && (meta === null || bound.id !== meta.viewId)
+  const docId = followBound ? bound.id : meta?.viewId ?? null
+  const sceneBase = followBound ? bound.sceneUrl : meta?.sceneUrl
+  const polledVersion = useDocVersion(docId)
+  const liveUrl = useMemo(() => withDocVersion(sceneBase, polledVersion), [sceneBase, polledVersion])
+  const live = useScene(liveUrl)
+  const previewScene = useScene(preview?.sceneUrl)
+  const version = useMemo(() => sceneVersion(liveUrl), [liveUrl])
+  const { tree } = useFeatureTree(docId, version)
+  const [treeOpen, setTreeOpen] = useState(true)
+  /** The highlighted body's mesh name (tree ↔ viewport selection). */
+  const [selected, setSelected] = useState<string | null>(null)
+  /** Mesh names hidden via the tree's eye toggles (bodies + sketch wires). */
+  const [hidden, setHidden] = useState<ReadonlySet<string>>(new Set())
+  const hiddenList = useMemo(() => [...hidden], [hidden])
+
+  // Drop the selection/visibility when switching documents — names belong to
+  // one document.
+  useEffect(() => {
+    setSelected(null)
+    setHidden(new Set())
+  }, [docId])
+
+  useEffect(() => {
+    if (liveUrl !== undefined && preview !== null) setPreviewDoc(null)
+  }, [liveUrl])
+
+  if (preview !== null) {
+    return (
+      <div style={panelStyles.sceneFill}>
+        <div style={panelStyles.previewBar}>
+          <span style={panelStyles.previewLabel}>预览: {preview.name}</span>
+          <button type="button" style={panelStyles.previewBack} onClick={() => { setPreviewDoc(null) }}>
+            返回跟踪
+          </button>
+        </div>
+        <Viewport scene={previewScene.scene} error={previewScene.error} fill />
+      </div>
+    )
+  }
+  if (meta === null && !followBound) return <EmptyPartStudio />
+  return (
+    <div style={panelStyles.assemblyStage}>
+      <div style={panelStyles.sceneFill}>
+        <Viewport scene={live.scene} error={live.error} fill highlight={selected} hidden={hiddenList} />
+      </div>
+      {treeOpen ? (
+        <div style={panelStyles.treeFloat}>
+          <FeatureTree
+            tree={tree}
+            selected={selected}
+            onSelect={setSelected}
+            hidden={hidden}
+            onToggleHidden={(names) => {
+              setHidden((previous) => {
+                const next = new Set(previous)
+                const allHidden = names.every((name) => next.has(name))
+                for (const name of names) {
+                  if (allHidden) next.delete(name)
+                  else next.add(name)
+                }
+                return next
+              })
+            }}
+            onCollapse={() => { setTreeOpen(false) }}
+          />
+        </div>
+      ) : (
+        <button
+          type="button"
+          style={panelStyles.treeRail}
+          onClick={() => { setTreeOpen(true) }}
+          aria-label="展开特征树"
+          title="展开特征树"
+        >
+          ›
+        </button>
+      )}
+    </div>
+  )
+}
+
+/** 装配体: the composed, per-instance colored scene with the assembly tree
+ *  (PARTS + CONSTRAINTS) floating over it. Clicking a part row highlights its
+ *  solid; the row's eye toggles its visibility. */
+function AssemblyTabBody({ meta }: { meta: CadViewMeta | null }): JSX.Element {
+  // The assembly viewId is `asm-<docId>`; the scene URL's ?v= is the document
+  // version, so the tree refetches exactly when the assembly changes.
+  const docId = meta !== null && meta.viewId.startsWith('asm-') ? meta.viewId.slice(4) : null
+  const polledVersion = useDocVersion(docId)
+  const liveUrl = useMemo(() => withDocVersion(meta?.sceneUrl, polledVersion), [meta?.sceneUrl, polledVersion])
+  const { scene, error } = useScene(liveUrl)
+  const version = useMemo(() => sceneVersion(liveUrl), [liveUrl])
+  const { tree } = useAssemblyTree(docId, version)
+  const [treeOpen, setTreeOpen] = useState(true)
+  /** The highlighted part's mesh name (tree ↔ viewport selection). */
+  const [selected, setSelected] = useState<string | null>(null)
+  /** Part names hidden via the tree's eye toggles. */
+  const [hidden, setHidden] = useState<ReadonlySet<string>>(new Set())
+  const hiddenList = useMemo(() => [...hidden], [hidden])
+
+  // Drop the selection/visibility when switching documents — names belong to
+  // one document.
+  useEffect(() => {
+    setSelected(null)
+    setHidden(new Set())
+  }, [docId])
+
+  if (meta === null) {
+    return (
+      <EmptyTabState
+        icon={<AssemblyIcon />}
+        title="装配体为空"
+        hint="在对话中说「把 b1 和 b2 装配起来，b2 放到 (60, 0, 0)」，或使用 cad_assembly_insert 工具插入实例"
+      />
+    )
+  }
+  return (
+    <div style={panelStyles.assemblyStage}>
+      <div style={panelStyles.sceneFill}>
+        <Viewport scene={scene} error={error} fill highlight={selected} hidden={hiddenList} />
+      </div>
+      {treeOpen ? (
+        <div style={panelStyles.treeFloat}>
+          <AssemblyTree
+            tree={tree}
+            selected={selected}
+            onSelect={setSelected}
+            hidden={hidden}
+            onToggleHidden={(part) => {
+              setHidden((previous) => {
+                const next = new Set(previous)
+                if (next.has(part.name)) next.delete(part.name)
+                else next.add(part.name)
+                return next
+              })
+            }}
+            onCollapse={() => { setTreeOpen(false) }}
+          />
+        </div>
+      ) : (
+        <button
+          type="button"
+          style={panelStyles.treeRail}
+          onClick={() => { setTreeOpen(true) }}
+          aria-label="展开装配树"
+          title="展开装配树"
+        >
+          ›
+        </button>
+      )}
+    </div>
+  )
+}
+
+/** 工程图: the drawing sheet (pan/zoom SVG), or an empty state. */
+function DrawingTabBody({ meta }: { meta: CadViewMeta | null }): JSX.Element {
+  const { scene, error } = useScene(meta?.sceneUrl)
+  const theme = useCadTheme()
+  if (meta === null) {
+    return (
+      <EmptyTabState
+        icon={<DrawingIcon />}
+        title="还没有工程图"
+        hint="在对话中说「给 b1 出一张 A3 工程图」，或使用 cad_drawing 工具生成三视图 + 轴测图"
+      />
+    )
+  }
+  return (
+    <div style={{ ...panelStyles.sceneFill, background: cadCanvasBackground(theme) }}>
+      <Viewport scene={scene} error={error} fill />
+    </div>
+  )
+}
+
+function EmptyTabState({ icon, title, hint }: { icon: JSX.Element; title: string; hint: string }): JSX.Element {
+  return (
+    <div style={panelStyles.emptyState}>
+      <div style={panelStyles.emptyIcon}>{icon}</div>
+      <div style={panelStyles.emptyTitle}>{title}</div>
+      <div style={panelStyles.emptyHint}>{hint}</div>
+    </div>
+  )
+}
+
+// ── pieces ───────────────────────────────────────────────────────────────────
+
+function statsLine(meta: CadViewMeta): string {
+  const parts: string[] = []
+  if (meta.kind === '3d') {
+    const unit = meta.doc === 'assembly' ? ' 实例' : ' 体'
+    if (meta.stats.meshes !== undefined) parts.push(`${meta.stats.meshes}${unit}`)
+    if (meta.stats.triangles !== undefined) parts.push(`${meta.stats.triangles.toLocaleString()} 三角面`)
+  } else if (meta.stats.entities !== undefined) {
+    parts.push(`${meta.stats.entities.toLocaleString()} 实体`)
+  }
+  return parts.join(' · ')
+}
+
+/**
+ * The pre-modeling state: an empty CAD editor — grid, XYZ axes and the
+ * ViewCube, but no geometry. No demo parts are loaded by default; once the
+ * session produces a CAD result the panel swaps to live model tracking.
+ */
+function EmptyPartStudio(): JSX.Element {
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const theme = useCadTheme()
+
+  useEffect(() => {
+    const container = containerRef.current
+    if (container === null) return
+    const handle = mountCadEditor3D(container, { part: null })
+    return () => {
+      handle.dispose()
+    }
+  }, [])
+
+  return (
+    <div style={panelStyles.demoRoot}>
+      <div style={panelStyles.demoCaption}>Part Studio</div>
+      <div style={{ ...panelStyles.demoViewport, background: cadCanvasBackground(theme) }}>
+        <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
+      </div>
+      <div style={panelStyles.demoHint}>
+        建模区为空 · 在对话中描述零件（如「建一个 100×60×10 的板，中间打 ⌀20 孔」），建模后此页签实时跟踪最新模型
+      </div>
+    </div>
+  )
+}
+
+const panelStyles: Record<string, React.CSSProperties> = {
+  paneRoot: {
+    width: '100%',
+    height: '100%',
+    display: 'flex',
+    flexDirection: 'column',
+    minWidth: 0,
+    minHeight: 0,
+    background: 'var(--dsw-alias-bg-base, #fff)',
+  },
+  // ── tab strip (Codex-style) ──────────────────────────────────────────────
+  tabStripRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    padding: '6px 8px 6px 12px',
+    flex: 'none',
+    borderBottom: '1px solid var(--dsw-alias-border-l1, #eceff3)',
+    background: 'var(--dsw-alias-bg-subtle, #f7f8fa)',
+    position: 'relative',
+  },
+  tabStrip: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 4,
+    flex: '1 1 auto',
+    minWidth: 0,
+    overflow: 'hidden',
+  },
+  tab: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 5,
+    padding: '4px 6px 4px 9px',
+    borderRadius: 7,
+    border: '1px solid transparent',
+    color: 'var(--dsw-alias-label-tertiary, #6b7280)',
+    cursor: 'pointer',
+    userSelect: 'none',
+    flex: 'none',
+    maxWidth: 150,
+    lineHeight: '18px',
+  },
+  tabActive: {
+    background: 'var(--dsw-alias-bg-base, #fff)',
+    borderColor: 'var(--dsw-alias-border-l1, #e2e5ea)',
+    color: 'var(--dsw-alias-label-primary, #1f2937)',
+    boxShadow: '0 1px 2px rgba(16,24,40,0.06)',
+  },
+  tabIcon: {
+    display: 'flex',
+    alignItems: 'center',
+    opacity: 0.75,
+    flex: 'none',
+  },
+  tabIconActive: {
+    display: 'flex',
+    alignItems: 'center',
+    color: 'var(--dsw-alias-label-primary, #4d6bfe)',
+    flex: 'none',
+  },
+  tabLabel: {
+    fontSize: 12,
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+  },
+  tabClose: {
+    border: 'none',
+    background: 'transparent',
+    color: 'var(--dsw-alias-label-tertiary, #9ca3af)',
+    fontSize: 13,
+    lineHeight: '16px',
+    width: 16,
+    height: 16,
+    borderRadius: 4,
+    cursor: 'pointer',
+    padding: 0,
+    flex: 'none',
+    textAlign: 'center',
+  },
+  addTab: {
+    flex: 'none',
+    width: 24,
+    height: 24,
+    marginLeft: 2,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    border: '1px solid var(--dsw-alias-border-l1, #e2e5ea)',
+    borderRadius: 7,
+    background: 'var(--dsw-alias-bg-base, #fff)',
+    color: 'var(--dsw-alias-label-secondary, #374151)',
+    fontSize: 15,
+    lineHeight: '18px',
+    cursor: 'pointer',
+    padding: 0,
+  },
+  menu: {
+    position: 'absolute',
+    top: 40,
+    left: 12,
+    zIndex: 20,
+    minWidth: 230,
+    padding: 5,
+    background: 'var(--dsw-alias-bg-base, #fff)',
+    border: '1px solid var(--dsw-alias-border-l1, #e2e5ea)',
+    borderRadius: 10,
+    boxShadow: '0 12px 32px -12px rgba(16,24,40,0.24)',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 1,
+  },
+  menuItem: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+    padding: '7px 9px',
+    border: 'none',
+    borderRadius: 7,
+    background: 'transparent',
+    color: 'var(--dsw-alias-label-primary, #1f2937)',
+    cursor: 'pointer',
+    textAlign: 'left',
+    font: 'inherit',
+    fontSize: 12.5,
+  },
+  menuIcon: {
+    display: 'flex',
+    alignItems: 'center',
+    color: 'var(--dsw-alias-label-secondary, #374151)',
+    flex: 'none',
+  },
+  menuLabel: {
+    fontWeight: 600,
+    flex: 'none',
+  },
+  menuHint: {
+    color: 'var(--dsw-alias-label-tertiary, #9ca3af)',
+    fontSize: 11,
+    marginLeft: 'auto',
+    whiteSpace: 'nowrap',
+  },
+  // ── file space (documents) ───────────────────────────────────────────────
+  fileButton: {
+    flex: 'none',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: 24,
+    height: 24,
+    marginLeft: 4,
+    border: '1px solid var(--dsw-alias-border-l2, #c4c9d0)',
+    borderRadius: 6,
+    background: 'transparent',
+    color: 'var(--dsw-alias-label-secondary, #374151)',
+    cursor: 'pointer',
+    padding: 0,
+  },
+  docsHeader: {
+    fontSize: 11,
+    fontWeight: 600,
+    color: 'var(--dsw-alias-label-tertiary, #6b7280)',
+    padding: '5px 9px 3px',
+    letterSpacing: '0.02em',
+  },
+  docsHintRow: {
+    fontSize: 12,
+    color: 'var(--dsw-alias-label-tertiary, #6b7280)',
+    padding: '8px 9px',
+  },
+  docsError: {
+    fontSize: 12,
+    color: 'var(--dsw-alias-state-error-primary, #d92d20)',
+    padding: '4px 9px',
+  },
+  docsFooter: {
+    fontSize: 11,
+    color: 'var(--dsw-alias-label-tertiary, #9ca3af)',
+    padding: '5px 9px 3px',
+    borderTop: '1px solid var(--dsw-alias-border-l1, #e2e5ea)',
+    marginTop: 3,
+  },
+  docRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 2,
+  },
+  docRowMain: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+    flex: '1 1 auto',
+    minWidth: 0,
+    padding: '7px 9px',
+    border: 'none',
+    borderRadius: 7,
+    background: 'transparent',
+    color: 'var(--dsw-alias-label-primary, #1f2937)',
+    cursor: 'pointer',
+    textAlign: 'left',
+    font: 'inherit',
+    fontSize: 12.5,
+  },
+  docDelete: {
+    flex: 'none',
+    width: 22,
+    height: 22,
+    border: 'none',
+    borderRadius: 6,
+    background: 'transparent',
+    color: 'var(--dsw-alias-label-tertiary, #9ca3af)',
+    fontSize: 14,
+    lineHeight: '20px',
+    cursor: 'pointer',
+    padding: 0,
+  },
+  docConfirm: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 4,
+    flex: 'none',
+    padding: '0 4px 0 0',
+  },
+  docConfirmYes: {
+    border: 'none',
+    borderRadius: 6,
+    background: 'var(--dsw-alias-state-error-primary, #d92d20)',
+    color: '#fff',
+    fontSize: 11,
+    padding: '3px 8px',
+    cursor: 'pointer',
+  },
+  docConfirmNo: {
+    border: '1px solid var(--dsw-alias-border-l2, #c4c9d0)',
+    borderRadius: 6,
+    background: 'transparent',
+    color: 'var(--dsw-alias-label-secondary, #374151)',
+    fontSize: 11,
+    padding: '3px 8px',
+    cursor: 'pointer',
+  },
+  previewBar: {
+    flex: 'none',
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+    padding: '5px 10px',
+    borderBottom: '1px solid var(--dsw-alias-border-l1, #e2e5ea)',
+    background: 'var(--dsw-alias-bg-subtle, #f5f6f8)',
+  },
+  previewLabel: {
+    flex: '1 1 auto',
+    minWidth: 0,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+    fontSize: 12,
+    color: 'var(--dsw-alias-label-primary, #1f2937)',
+    fontWeight: 600,
+  },
+  previewBack: {
+    flex: 'none',
+    border: '1px solid var(--dsw-alias-border-l2, #c4c9d0)',
+    borderRadius: 6,
+    background: 'transparent',
+    color: 'var(--dsw-alias-label-secondary, #374151)',
+    fontSize: 11,
+    padding: '2px 8px',
+    cursor: 'pointer',
+  },
+  headerStats: {
+    flex: 'none',
+    fontSize: 11,
+    color: 'var(--dsw-alias-label-tertiary, #6b7280)',
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    maxWidth: '30%',
+  },
+  body: {
+    flex: '1 1 auto',
+    minHeight: 0,
+    display: 'flex',
+    flexDirection: 'column',
+  },
+  sceneFill: {
+    flex: '1 1 auto',
+    minHeight: 0,
+    display: 'flex',
+    flexDirection: 'column',
+  },
+  assemblyStage: {
+    flex: '1 1 auto',
+    minHeight: 0,
+    position: 'relative',
+    display: 'flex',
+    flexDirection: 'column',
+  },
+  // The assembly tree floats over the viewport's top-left corner (rounded
+  // card, shadow) — it never displaces the 3D area.
+  treeFloat: {
+    position: 'absolute',
+    top: 8,
+    left: 8,
+    zIndex: 6,
+    maxHeight: 'calc(100% - 16px)',
+    display: 'flex',
+    flexDirection: 'column',
+  },
+  treeRail: {
+    position: 'absolute',
+    top: 8,
+    left: 8,
+    zIndex: 6,
+    width: 22,
+    height: 22,
+    border: '1px solid var(--dsw-alias-border-l1, #e2e5ea)',
+    borderRadius: 7,
+    background: 'var(--dsw-alias-bg-base, #fff)',
+    color: 'var(--dsw-alias-label-tertiary, #9ca3af)',
+    fontSize: 13,
+    lineHeight: '18px',
+    cursor: 'pointer',
+    padding: 0,
+    boxShadow: '0 4px 12px -6px rgba(16,24,40,0.25)',
+  },
+  emptyState: {
+    flex: '1 1 auto',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    padding: 24,
+    color: 'var(--dsw-alias-label-tertiary, #9ca3af)',
+    textAlign: 'center',
+  },
+  emptyIcon: {
+    display: 'flex',
+    color: 'var(--dsw-alias-label-tertiary, #c0c6cf)',
+    transform: 'scale(2)',
+    marginBottom: 6,
+  },
+  emptyTitle: {
+    fontSize: 13,
+    fontWeight: 600,
+    color: 'var(--dsw-alias-label-secondary, #6b7280)',
+  },
+  emptyHint: {
+    fontSize: 11.5,
+    lineHeight: '18px',
+    maxWidth: 300,
+  },
+  demoRoot: {
+    flex: '1 1 auto',
+    minHeight: 0,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 6,
+    padding: '10px 10px 12px',
+  },
+  demoCaption: {
+    color: 'var(--dsw-alias-label-tertiary, #6b7280)',
+    fontSize: 11,
+    textTransform: 'uppercase',
+    letterSpacing: '0.05em',
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    flex: 'none',
+  },
+  demoViewport: {
+    position: 'relative',
+    flex: '1 1 auto',
+    minHeight: 0,
+    borderRadius: 10,
+    overflow: 'hidden',
+  },
+  demoHint: {
+    flex: 'none',
+    color: 'var(--dsw-alias-label-tertiary, #9ca3af)',
+    fontSize: 11,
+    lineHeight: '17px',
+    textAlign: 'center',
+  },
+}

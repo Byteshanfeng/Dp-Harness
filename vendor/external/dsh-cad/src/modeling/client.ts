@@ -1,0 +1,273 @@
+/**
+ * Main-thread modeling client: one lazily spawned OCCT worker per client,
+ * job correlation, and transferable buffers — the same shape as
+ * convert/step.ts. The module default is a shared singleton (the live
+ * modeling session); isolated conversions (e.g. .dcprt replay) spawn their
+ * own client via createModelClient() and dispose() it when done, so they
+ * never clobber the session state.
+ */
+import { Worker } from 'node:worker_threads'
+import { fileURLToPath } from 'node:url'
+
+export interface WorkerMesh {
+  name: string
+  positions: Float32Array
+  normals: Float32Array
+  indices: Uint32Array
+  vertexCount: number
+  triangleCount: number
+}
+
+/** One placed reference of a body inside the assembly. */
+export interface AssemblyInstance {
+  instanceId: string
+  bodyId: string
+  name: string
+  translate: [number, number, number]
+  rotate: [number, number, number]
+}
+
+/** One projected hidden-line drawing view (flat [x,y, x,y, …] polylines, mm). */
+export interface DrawingView {
+  name: string
+  visible: number[][]
+  hidden: number[][]
+}
+
+export interface OpResult {
+  bodyId?: string
+  name?: string
+  removed?: string[]
+  edges?: number
+  mesh?: WorkerMesh
+  meshes?: Array<WorkerMesh & { bodyId: string }>
+  bytes?: ArrayBuffer
+  volume?: number
+  /** Center of mass [x,y,z] (occt.ts backend). */
+  centroid?: number[]
+  deleted?: string
+  cleared?: boolean
+  views?: DrawingView[]
+  instanceId?: string
+  instances?: AssemblyInstance[]
+  /** Pattern op: the newly created copy bodies with their meshes. */
+  created?: Array<{ bodyId: string; name?: string; mesh?: WorkerMesh }>
+  /** Name of the sketch touched by a sketch op. */
+  sketch?: string
+  /** Flat [x,y,z,…] display polyline of the sketch (sketch_set; occt.ts backend). */
+  wire?: number[]
+  /** Flat [x,y,z,…] TRUE vertex points of the sketch (corners/ends; circles carry none). */
+  points?: number[]
+  /** Triangulated enclosed region { positions, indices } (the translucent fill). */
+  fill?: { positions: number[]; indices: number[] }
+  /** import_step structure probe: unique parts + placed leaves (no geometry). */
+  stepStructure?: {
+    parts: Array<{ name: string; key: string }>
+    leaves: Array<{ part: number; name: string; translate: [number, number, number]; rotate: [number, number, number] }>
+  }
+}
+
+export interface DrawingViewSpec {
+  name: string
+  dir: [number, number, number]
+  xDir: [number, number, number]
+}
+
+/** One loft section: a flat world-space loop, or a curve/profile section. */
+export type LoftSection =
+  | number[]
+  | {
+      /** Flat [x,y,z, …] loop (polygon, or a smooth B-spline when `smooth`). */
+      points?: number[]
+      /** Flat [x,y,z, …] points interpolated by a closed B-spline. */
+      through?: number[]
+      /** 2D profile (flat [x,y,…], {start,segments}, or {circle}) in the section plane. */
+      profile?: unknown
+      /** Plane origin for `profile` (default world origin). */
+      at?: [number, number, number]
+      /** Plane normal for `profile` (default +Z). */
+      normal?: [number, number, number]
+      /** In-plane X axis for `profile` (default world +X projected). */
+      xAxis?: [number, number, number]
+      /** Override the loft-level `smooth` flag for this section. */
+      smooth?: boolean
+    }
+
+export type ModelOp =
+  | { kind: 'create_prim'; bodyId: string; prim: string; params?: Record<string, unknown>; name?: string }
+  | { kind: 'extrude_profile'; bodyId: string; points?: number[]; profile?: unknown; sketch?: string; height?: number; base?: number; name?: string }
+  | { kind: 'loft'; bodyId: string; sections: LoftSection[]; solid?: boolean; ruled?: boolean; smooth?: boolean; name?: string }
+  | { kind: 'revolve'; bodyId: string; profile?: unknown; sketch?: string; angle?: number; axis?: [number, number, number]; at?: [number, number, number]; name?: string }
+  | { kind: 'chamfer'; target: string; distance: number }
+  | { kind: 'shell'; target: string; thickness: number; openNormals?: Array<[number, number, number]>; faces?: number[] }
+  | { kind: 'draft'; target: string; angle: number; direction?: [number, number, number]; faces?: number[] }
+  | { kind: 'pattern'; target: string; mode: 'linear' | 'circular'; count: number; delta?: [number, number, number]; axis?: [number, number, number]; at?: [number, number, number]; angle?: number }
+  | { kind: 'sweep'; bodyId: string; profile?: unknown; sketch?: string; path: number[]; name?: string }
+  | { kind: 'boolean'; op: 'fuse' | 'cut' | 'common'; target: string; tools: string[] }
+  | { kind: 'fillet'; target: string; radius: number }
+  | { kind: 'transform'; target: string; translate?: [number, number, number]; rotate?: [number, number, number]; mirror?: [number, number, number] }
+  | { kind: 'tessellate_all' }
+  | { kind: 'export'; target: string; format: 'step' | 'stl' }
+  | { kind: 'volume'; target: string }
+  | { kind: 'delete'; target: string }
+  | { kind: 'reset' }
+  | { kind: 'drawing'; target: string; views: DrawingViewSpec[]; sceneViewId?: string; name?: string; paper?: 'A4' | 'A3' }
+  | { kind: 'assembly_insert'; instanceId: string; bodyId: string; name?: string; translate?: [number, number, number]; rotate?: [number, number, number] }
+  | { kind: 'assembly_transform'; instanceId: string; translate?: [number, number, number]; rotate?: [number, number, number] }
+  | { kind: 'assembly_remove'; instanceId: string }
+  | { kind: 'assembly_list' }
+  | {
+      kind: 'assembly_joint'
+      instanceId: string
+      label: string
+      /** Normalized JointSpec (validated on the main thread before posting). */
+      joint: unknown
+    }
+  | {
+      kind: 'assembly_connect'
+      /** The child instance being placed. */
+      instanceId: string
+      parent: string
+      parentLabel: string
+      childLabel: string
+      /** Merged into the parent joint's value at connect time (optional). */
+      value?: unknown
+    }
+  | { kind: 'assembly_joint_value'; instanceId: string; label: string; value: unknown }
+  | { kind: 'assembly_explode'; factor: number }
+  | {
+      kind: 'import_step'
+      /** Sidecar asset path (workspace .dsh-cad/docs/assets/<hash>.step). */
+      path: string
+      /** Assignments for the materialize phase (absent = structure probe). */
+      bodies?: Array<{ bodyId: string; name: string }>
+      instances?: Array<{ instanceId: string; bodyId: string; name: string; translate: [number, number, number]; rotate: [number, number, number] }>
+    }
+  | { kind: 'constraints'; model: { entities: unknown[]; constraints: unknown[] } }
+  | { kind: 'export_assembly'; format: 'step' | 'stl' }
+  | { kind: 'sketch_set'; name: string; profile: unknown }
+  | { kind: 'sketch_delete'; name: string }
+
+interface Pending {
+  resolve: (result: OpResult) => void
+  reject: (error: Error) => void
+  timer: NodeJS.Timeout
+}
+
+export interface ModelClient {
+  /** Run one modeling operation on this client's worker. */
+  run(op: ModelOp, timeoutMs?: number): Promise<OpResult>
+  /** Terminate the worker and fail any in-flight jobs. */
+  dispose(): void
+}
+
+export function createModelClient(): ModelClient {
+  let worker: Worker | null = null
+  let ready: Promise<void> | null = null
+  let disposed = false
+  let nextJobId = 1
+  const pending = new Map<number, Pending>()
+
+  function spawn(): { worker: Worker; ready: Promise<void> } {
+    const spawned = new Worker(
+      new URL('./modeling-worker.cjs', import.meta.url),
+    )
+    const readyPromise = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('modeling kernel startup timed out')), 60_000)
+      const onReady = (message: { jobId: number; ok: boolean; error?: string }): void => {
+        clearTimeout(timer)
+        if (message.ok) resolve()
+        else reject(new Error(message.error ?? 'modeling kernel init failed'))
+      }
+      ;(spawned as unknown as { once: (event: string, listener: typeof onReady) => void }).once('message', onReady)
+    })
+
+    spawned.on('message', (response: { jobId: number; ok: boolean; result?: OpResult; error?: string }) => {
+      const job = pending.get(response.jobId)
+      if (job === undefined) return
+      pending.delete(response.jobId)
+      clearTimeout(job.timer)
+      if (response.ok && response.result !== undefined) job.resolve(response.result)
+      else job.reject(new Error(response.error ?? 'modeling operation failed'))
+    })
+    spawned.on('error', (error: Error) => failAll(error))
+    spawned.on('exit', (code: number) => {
+      if (code !== 0) failAll(new Error(`the modeling worker exited unexpectedly (code ${code})`))
+      worker = null
+      ready = null
+    })
+
+    return { worker: spawned, ready: readyPromise }
+  }
+
+  function failAll(error: Error): void {
+    for (const [jobId, job] of pending) {
+      pending.delete(jobId)
+      clearTimeout(job.timer)
+      job.reject(error)
+    }
+  }
+
+  async function ensureWorker(): Promise<Worker> {
+    if (worker !== null && ready !== null) {
+      await ready
+      return worker
+    }
+    const spawned = spawn()
+    worker = spawned.worker
+    ready = spawned.ready
+    await ready
+    return worker
+  }
+
+  return {
+    async run(op: ModelOp, timeoutMs = 180_000): Promise<OpResult> {
+      if (disposed) throw new Error('modeling client has been disposed')
+      const active = await ensureWorker()
+      const jobId = nextJobId++
+      return new Promise<OpResult>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(jobId)
+          reject(new Error(`modeling operation timed out after ${timeoutMs}ms`))
+        }, timeoutMs)
+        pending.set(jobId, { resolve, reject, timer })
+        active.postMessage({ jobId, op })
+      })
+    },
+    dispose(): void {
+      if (disposed) return
+      disposed = true
+      failAll(new Error('modeling client disposed'))
+      if (worker !== null) void worker.terminate()
+      worker = null
+      ready = null
+    },
+  }
+}
+
+const sharedClient = createModelClient()
+
+/**
+ * Monotonic count of `reset` ops posted through the shared worker. Any
+ * out-of-band replay (e.g. opening a .dcprt) resets the worker and bumps the
+ * epoch, so the modeling session owner can detect staleness and re-replay
+ * its document before the next op.
+ */
+let resetEpoch = 0
+
+/** Run one modeling operation on the shared session worker. */
+export async function runModelOp(op: ModelOp, timeoutMs = 180_000): Promise<OpResult> {
+  const result = await sharedClient.run(op, timeoutMs)
+  if (op.kind === 'reset') resetEpoch += 1
+  return result
+}
+
+/** Current reset epoch of the shared worker (see above). */
+export function workerResetEpoch(): number {
+  return resetEpoch
+}
+
+/** Test/Dev helper: hard worker file path (used by the vitest suite). */
+export function workerEntryPath(): string {
+  return fileURLToPath(new URL('./modeling-worker.cjs', import.meta.url))
+}

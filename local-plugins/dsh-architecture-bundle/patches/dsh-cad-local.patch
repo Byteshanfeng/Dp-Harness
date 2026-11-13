@@ -1,0 +1,454 @@
+diff --git a/README.md b/README.md
+index 835e9ec..f629e0b 100644
+--- a/README.md
++++ b/README.md
+@@ -58 +58 @@ Cumulative downloads from the npm registry, refreshed daily by CI:
+-| 🖥️ Resident CAD panel | A permanent panel right of the conversation: Codex-style tabs (Part / Assembly / Drawing), tracking the latest model in real time while modeling. A host-independent liveness poll (`GET /dsh-cad/docs` → per-document op count) keeps the viewport following modeling ops even when the conversation meta pipeline goes stale, and auto-returns from a file preview |
++| 🖥️ Resident CAD panel | Open CAD from the right sidebar when needed; a new session keeps the sidebar closed. Its Part / Assembly / Drawing tabs track that session's model while modeling. A host-independent liveness poll (`GET /dsh-cad/docs` → per-document op count) keeps the viewport following modeling ops even when the conversation meta pipeline goes stale, and auto-returns from a file preview |
+diff --git a/README.zh-CN.md b/README.zh-CN.md
+index edbd24e..d21a368 100644
+--- a/README.zh-CN.md
++++ b/README.zh-CN.md
+@@ -47 +47 @@ npm 官方源的累计下载量，由 CI 每日刷新：
+-| 🗂️ Codex 式文档页签 | 右侧显示区页签栏 + 「+」菜单：**零件**（Part Studio，默认）/ **装配体**（实例插入/移动/移除）/ **工程图**（真实隐藏线图纸），页签可关闭、常驻不丢状态 |
++| 🗂️ Codex 式文档页签 | 按需从右侧边栏打开 CAD；新会话保持边栏关闭。页签栏 + 「+」菜单提供**零件**（Part Studio，默认）/ **装配体**（实例插入/移动/移除）/ **工程图**（真实隐藏线图纸），页签可关闭、常驻不丢状态 |
+diff --git a/client/doc-revision.ts b/client/doc-revision.ts
+index 72bfde7..6a7bfe0 100644
+--- a/client/doc-revision.ts
++++ b/client/doc-revision.ts
+@@ -39,0 +40 @@ let activeDoc: ActiveDoc | null = null
++let activeDocSession: string | null = null
+@@ -49,0 +51 @@ async function fetchVersions(): Promise<void> {
++  const requestedSession = pollSession
+@@ -51 +53 @@ async function fetchVersions(): Promise<void> {
+-    const url = pollSession === null ? '/dsh-cad/docs' : `/dsh-cad/docs?session=${encodeURIComponent(pollSession)}`
++    const url = requestedSession === null ? '/dsh-cad/docs' : `/dsh-cad/docs?session=${encodeURIComponent(requestedSession)}`
+@@ -54,0 +57 @@ async function fetchVersions(): Promise<void> {
++    if (requestedSession !== pollSession) return
+@@ -64,0 +68 @@ async function fetchVersions(): Promise<void> {
++    activeDocSession = requestedSession
+@@ -73,0 +78 @@ async function fetchVersions(): Promise<void> {
++    if (requestedSession !== pollSession) void fetchVersions()
+@@ -87,0 +93 @@ export function setPollSession(sessionId: string | null): void {
++  activeDocSession = null
+@@ -133,2 +139,2 @@ export function docVersion(docId: string | null): number | null {
+-export function useActiveDoc(): ActiveDoc | null {
+-  const getSnapshot = useCallback((): ActiveDoc | null => activeDoc, [])
++export function useActiveDoc(sessionId: string | null): ActiveDoc | null {
++  const getSnapshot = useCallback((): ActiveDoc | null => activeDocSession === sessionId ? activeDoc : null, [sessionId])
+diff --git a/client/pane.tsx b/client/pane.tsx
+index 85b916d..6f976ce 100644
+--- a/client/pane.tsx
++++ b/client/pane.tsx
+@@ -26 +26 @@ import { makeCadPaneBody } from './sidepanel.js'
+-import type { SessionsLike } from './sidepanel.js'
++import type { CurrentSessionLike, SessionsLike } from './sidepanel.js'
+@@ -30 +30 @@ const CAD_TAB_ID = 'dsh-cad'
+-/** The kind openTab() / session layouts record. */
++/** The kind recorded by the host's session layout. */
+@@ -36,6 +35,0 @@ const SERVICE_RETRY_DELAYS_MS = [100, 300, 600, 1200]
+-/**
+- * Auto-open retry cadence: the session surface the controller acts on mounts
+- * a beat after the services appear (and after any session switch settles).
+- */
+-const AUTO_OPEN_DELAYS_MS = [300, 900, 1800, 3000, 5000]
+-
+@@ -59 +53 @@ export interface PaneTabRegistryLike {
+-/** The plugin context surface the mounting reads (timer/effect are whitelisted verbs; optional for old hosts). */
++/** The plugin context surface the mounting reads (timer/effect are optional for old hosts). */
+@@ -61 +55,4 @@ export interface PaneClientContext {
+-  slots: { inject(slot: string, register: () => unknown): unknown }
++  slots: {
++    inject(slot: string, register: () => unknown): unknown
++    register(options: { name: string; key: string }, component: (props: never) => JSX.Element): unknown
++  }
+@@ -67,5 +63,0 @@ export interface PaneClientContext {
+-/** The `sidebarRight` controller slice auto-open needs (openTab throws until a session surface is mounted). */
+-interface PaneControllerLike {
+-  openTab(kind: string, options?: Record<string, unknown>): void
+-}
+-
+@@ -75,4 +67,8 @@ interface UiSessionLike {
+-    current?: {
+-      getSnapshot(): { key?: unknown }
+-      subscribe(fn: () => void): () => void
+-    }
++    current?: CurrentSessionLike
++  }
++}
++
++interface PresetSessionsLike extends SessionsLike {
++  list?: {
++    getSnapshot(): { byId?: Record<string, { projectionValues?: { agentPreset?: string } }> }
++    subscribe(fn: () => void): () => void
+@@ -120 +116 @@ function CadPaneTitle(props: { useTabInfo?: () => { tab?: { title?: string } } }
+-function tryRegisterCadPane(ctx: PaneClientContext, sessions: SessionsLike | undefined): boolean {
++function tryRegisterCadPane(ctx: PaneClientContext, sessions: SessionsLike | undefined): (() => void) | undefined {
+@@ -122 +118,3 @@ function tryRegisterCadPane(ctx: PaneClientContext, sessions: SessionsLike | und
+-  if (tabs == null || typeof tabs.register !== 'function') return false
++  if (tabs == null || typeof tabs.register !== 'function') return undefined
++  const liveSessions = (ctx.get?.('sessions') as SessionsLike | undefined) ?? sessions
++  const currentSession = (ctx.get?.('uiSession') as UiSessionLike | undefined)?.adapter?.current
+@@ -143 +141 @@ function tryRegisterCadPane(ctx: PaneClientContext, sessions: SessionsLike | und
+-        makeCadPaneBody(sessions) as unknown as (props: never) => JSX.Element,
++        makeCadPaneBody(liveSessions, currentSession) as unknown as (props: never) => JSX.Element,
+@@ -150 +148 @@ function tryRegisterCadPane(ctx: PaneClientContext, sessions: SessionsLike | und
+-    return true
++    return () => { for (const dispose of disposers.reverse()) dispose() }
+@@ -155 +153 @@ function tryRegisterCadPane(ctx: PaneClientContext, sessions: SessionsLike | und
+-    return false
++    return undefined
+@@ -160,7 +158,2 @@ function tryRegisterCadPane(ctx: PaneClientContext, sessions: SessionsLike | und
+- * Steer the rightbar presentation by replaying the host's own chrome button
+- * (collapse: the strip button inside [data-sidebar-right-panel]; expand: the
+- * banner's open button). The `layout` service an undeclared plugin gets via
+- * the optional lookup is a detached facade — closeRightbar/openRightbar there
+- * are verified no-ops live — while the chrome button goes through the host's
+- * real handler. Matched across locales, best-effort: a host markup change
+- * just leaves the host's own default presentation standing.
++ * Register the CAD tab while the current session uses the Architecture preset.
++ * Retry briefly while the host provides the sidebar and session services.
+@@ -168,17 +161,6 @@ function tryRegisterCadPane(ctx: PaneClientContext, sessions: SessionsLike | und
+-function steerRightbar(shown: boolean, delayMs: number): void {
+-  const press = (): void => {
+-    try {
+-      const scope: Document | Element | null = shown
+-        ? document
+-        : document.querySelector('[data-sidebar-right-panel]')
+-      if (scope === null) return
+-      const pattern = shown
+-        ? /(打开|展开|open|show|expand).*(右侧边栏|right|sidebar)/i
+-        : /(收起|折叠|collapse|hide).*(右侧边栏|right|sidebar)/i
+-      const button = Array.from(scope.querySelectorAll('button'))
+-        .find((candidate) => pattern.test(candidate.getAttribute('aria-label') ?? ''))
+-      if (button instanceof HTMLElement) button.click()
+-    } catch { /* best-effort; the host's default presentation stands */ }
+-  }
+-  setTimeout(press, delayMs)
+-}
++export function mountCadPanel(ctx: PaneClientContext, sessions: SessionsLike | undefined): void {
++  let disposed = false
++  let registered: (() => void) | undefined
++  let observing = false
++  let stopCurrent: (() => void) | undefined
++  let stopList: (() => void) | undefined
+@@ -186,48 +168,11 @@ function steerRightbar(shown: boolean, delayMs: number): void {
+-/**
+- * Auto-open the CAD tab whenever a session becomes current. The pane system
+- * starts every session with an empty rightbar — without this a fresh install
+- * shows no display area at all and the + menu is the only (undiscoverable)
+- * way in.
+- *
+- * Boot load: place the CAD tab, then collapse the rightbar — the host itself
+- * boots the rightbar open (verified live: open at t=0, before any plugin
+- * code), so an active collapse is what keeps the launch view clean. Session
+- * transitions (new session, switch to another conversation): place the tab
+- * and ensure the rightbar is expanded, so the display area is just there.
+- * While a session STAYS current, a deliberate close stays closed; the next
+- * transition re-opens.
+- *
+- * Session source: the host `uiSession` service's `adapter.current` store
+- * (the same signal sidebar-right watches). `openTab` throws until the host
+- * mounted the switched-to session's surface, so each transition runs a
+- * bounded retry chain, and a newer transition supersedes the older chain.
+- * The FIRST subscriber event is still boot (the current session's
+- * establishment lands after our subscribe), so it runs non-revealing like
+- * the boot itself.
+- */
+-function watchSessionsAndAutoOpen(ctx: PaneClientContext): void {
+-  const generation = { current: 0 }
+-  const attempt = (reveal: boolean, index: number): void => {
+-    if (index === 0) generation.current += 1
+-    const generationAtStart = generation.current
+-    const controller = ctx.get?.('sidebarRight') as PaneControllerLike | undefined
+-    if (controller != null && typeof controller.openTab === 'function') {
+-      try {
+-        controller.openTab(CAD_TAB_KIND)
+-        // Boot: wait out the host's post-placement presentation reactions
+-        // before collapsing; transitions: nudge the bar open only if it is
+-        // currently collapsed (the expand button is absent when shown).
+-        steerRightbar(reveal, reveal ? 150 : 900)
+-        return
+-      } catch { /* session surface not mounted yet — retry */ }
+-    }
+-    if (index >= AUTO_OPEN_DELAYS_MS.length) return
+-    const retry = (): void => {
+-      if (generationAtStart !== generation.current) return
+-      attempt(reveal, index + 1)
+-    }
+-    try {
+-      if (typeof ctx.setTimeout === 'function') ctx.setTimeout(retry, AUTO_OPEN_DELAYS_MS[index])
+-      else setTimeout(retry, AUTO_OPEN_DELAYS_MS[index])
+-    } catch {
+-      setTimeout(retry, AUTO_OPEN_DELAYS_MS[index])
++  const sync = (): void => {
++    const current = (ctx.get?.('uiSession') as UiSessionLike | undefined)?.adapter?.current
++    const liveSessions = (ctx.get?.('sessions') as PresetSessionsLike | undefined) ?? sessions as PresetSessionsLike | undefined
++    const list = liveSessions?.list
++    const key = current?.getSnapshot().key
++    const preset = typeof key === 'string' ? list?.getSnapshot().byId?.[key]?.projectionValues?.agentPreset : undefined
++    if (preset === 'architecture') {
++      registered ??= tryRegisterCadPane(ctx, sessions)
++    } else {
++      registered?.()
++      registered = undefined
+@@ -236,17 +180,0 @@ function watchSessionsAndAutoOpen(ctx: PaneClientContext): void {
+-  // Transitions after the boot load reveal; the first subscriber event is
+-  // the boot-time session establishment, so it collapses like the boot.
+-  let booted = false
+-  const onTransition = (): void => {
+-    const reveal = booted
+-    booted = true
+-    attempt(reveal, 0)
+-  }
+-  const uiSession = ctx.get?.('uiSession') as UiSessionLike | undefined
+-  const current = uiSession?.adapter?.current
+-  if (current != null && typeof current.subscribe === 'function' && typeof current.getSnapshot === 'function') {
+-    const unsubscribe = current.subscribe(onTransition)
+-    ctx.effect?.(() => unsubscribe, 'dsh-cad: session auto-open watcher')
+-  }
+-  // The boot load itself: tab in place, rightbar collapsed.
+-  attempt(false, 0)
+-}
+@@ -254,12 +181,0 @@ function watchSessionsAndAutoOpen(ctx: PaneClientContext): void {
+-/**
+- * Mount the CAD panel: the rightbar pane once `sidebarRightTabs` shows up
+- * (retried over the first ~1.6s — this plugin activates before the
+- * sidebar-right package provides its services). Hosts without the pane
+- * system (dsh < 0.2.x) mount no panel — the chat cards remain the CAD
+- * surface there.
+- */
+-export function mountCadPanel(ctx: PaneClientContext, sessions: SessionsLike | undefined): void {
+-  if (tryRegisterCadPane(ctx, sessions)) {
+-    watchSessionsAndAutoOpen(ctx)
+-    return
+-  }
+@@ -267,2 +183,12 @@ export function mountCadPanel(ctx: PaneClientContext, sessions: SessionsLike | u
+-    if (tryRegisterCadPane(ctx, sessions)) {
+-      watchSessionsAndAutoOpen(ctx)
++    if (disposed) return
++    const current = (ctx.get?.('uiSession') as UiSessionLike | undefined)?.adapter?.current
++    const liveSessions = (ctx.get?.('sessions') as PresetSessionsLike | undefined) ?? sessions as PresetSessionsLike | undefined
++    const list = liveSessions?.list
++    const tabs = ctx.get?.('sidebarRightTabs') as PaneTabRegistryLike | undefined
++    if (current !== undefined && list !== undefined && tabs !== undefined) {
++      if (!observing) {
++        stopCurrent = current.subscribe(sync)
++        stopList = list.subscribe(sync)
++        observing = true
++      }
++      sync()
+@@ -273,6 +199,2 @@ export function mountCadPanel(ctx: PaneClientContext, sessions: SessionsLike | u
+-    try {
+-      if (typeof ctx.setTimeout === 'function') ctx.setTimeout(retry, SERVICE_RETRY_DELAYS_MS[index])
+-      else setTimeout(retry, SERVICE_RETRY_DELAYS_MS[index])
+-    } catch {
+-      setTimeout(retry, SERVICE_RETRY_DELAYS_MS[index])
+-    }
++    if (typeof ctx.setTimeout === 'function') ctx.setTimeout(retry, SERVICE_RETRY_DELAYS_MS[index])
++    else setTimeout(retry, SERVICE_RETRY_DELAYS_MS[index])
+@@ -280,0 +203,6 @@ export function mountCadPanel(ctx: PaneClientContext, sessions: SessionsLike | u
++  ctx.effect?.(() => () => {
++    disposed = true
++    stopCurrent?.()
++    stopList?.()
++    registered?.()
++  }, 'dsh-cad: architecture pane visibility')
+diff --git a/client/sidepanel.tsx b/client/sidepanel.tsx
+index 014b6c6..0dc8dc5 100644
+--- a/client/sidepanel.tsx
++++ b/client/sidepanel.tsx
+@@ -13 +13 @@
+-import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from 'react'
++import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+@@ -16 +16 @@ import { mountCadEditor3D } from './viewer3d.js'
+-import { readKind, readLatest, subscribeLatest, useScene, Viewport } from './viewport.js'
++import { useScene, Viewport } from './viewport.js'
+@@ -33,0 +34,6 @@ export interface SessionsLike {
++/** The host's observable selection of the current session. */
++export interface CurrentSessionLike {
++  getSnapshot(): { key?: unknown }
++  subscribe(fn: () => void): () => void
++}
++
+@@ -73,8 +79,2 @@ let lastScanned: Record<DocKind, CadViewMeta | undefined> = EMPTY_METAS
+-/**
+- * The freshest CAD meta per tab kind of the current session. The session
+- * observable is authoritative (reactive whatever tab is visible); the
+- * card-fed latest-memory only drives the panel when the sessions service is
+- * unreachable.
+- */
+-function useKindMetas(useSessions: CadSidePanelProps['useSessions'], sessions: SessionsLike | undefined): Record<DocKind, CadViewMeta | null> {
+-  const current = useSessions?.((state) => state.current)
++/** The freshest CAD meta per tab kind of the current session. */
++function useKindMetas(current: string | null, sessions: SessionsLike | undefined): Record<DocKind, CadViewMeta | null> {
+@@ -82 +82 @@ function useKindMetas(useSessions: CadSidePanelProps['useSessions'], sessions: S
+-    if (sessions === undefined || current === undefined) return undefined
++    if (sessions === undefined || current === null) return undefined
+@@ -103,10 +103,4 @@ function useKindMetas(useSessions: CadSidePanelProps['useSessions'], sessions: S
+-  // Card-driven memory keeps the no-sessions fallback current.
+-  const [, forceUpdate] = useReducer((tick: number) => tick + 1, 0)
+-  useEffect(() => subscribeLatest(() => { forceUpdate() }), [])
+-
+-  if (sessions !== undefined) {
+-    return {
+-      part: sessionMetas.part ?? null,
+-      assembly: sessionMetas.assembly ?? readKind('assembly')?.meta ?? null,
+-      drawing: sessionMetas.drawing ?? readKind('drawing')?.meta ?? null,
+-    }
++  return {
++    part: sessionMetas.part ?? null,
++    assembly: sessionMetas.assembly ?? null,
++    drawing: sessionMetas.drawing ?? null,
+@@ -114,4 +107,0 @@ function useKindMetas(useSessions: CadSidePanelProps['useSessions'], sessions: S
+-  // Kind-filtered fallbacks: readLatest() is the freshest result of ANY kind,
+-  // so a drawing's meta (viewId = drawing scene id, not a document id) would
+-  // drive the Part tab's feature-tree fetch into a 404 (issue #6).
+-  return { part: readKind('part')?.meta ?? null, assembly: readKind('assembly')?.meta ?? null, drawing: readKind('drawing')?.meta ?? null }
+@@ -187,0 +178 @@ interface PreviewDoc {
++  sessionId: string | null
+@@ -203,2 +194,2 @@ function setPreviewDoc(next: PreviewDoc | null): void {
+-function usePreviewDoc(): PreviewDoc | null {
+-  return useSyncExternalStore(
++function usePreviewDoc(sessionId: string | null): PreviewDoc | null {
++  const preview = useSyncExternalStore(
+@@ -213,0 +205 @@ function usePreviewDoc(): PreviewDoc | null {
++  return preview?.sessionId === sessionId ? preview : null
+@@ -338 +330 @@ function relTime(iso: string): string {
+-function DocsMenu({ activeDocId, onClose }: { activeDocId: string | null; onClose: () => void }): JSX.Element {
++function DocsMenu({ activeDocId, sessionId, onClose }: { activeDocId: string | null; sessionId: string | null; onClose: () => void }): JSX.Element {
+@@ -402 +394 @@ function DocsMenu({ activeDocId, onClose }: { activeDocId: string | null; onClos
+-                  setPreviewDoc({ docId: doc.id, name: doc.name, sceneUrl: doc.sceneUrl })
++                  setPreviewDoc({ sessionId, docId: doc.id, name: doc.name, sceneUrl: doc.sceneUrl })
+@@ -454,0 +447 @@ function CadPanelContent(props: {
++  currentSession: CurrentSessionLike | undefined
+@@ -458,2 +451,6 @@ function CadPanelContent(props: {
+-  const metas = useKindMetas(props.useSessions, props.sessions)
+-  const sessionId = props.useSessions?.((state) => state.current) ?? null
++  const currentSession = props.currentSession
++  const subscribeCurrent = useCallback((onChange: () => void) => currentSession?.subscribe(onChange) ?? (() => {}), [currentSession])
++  const readCurrent = useCallback(() => currentSession?.getSnapshot().key, [currentSession])
++  const currentKey = useSyncExternalStore(subscribeCurrent, readCurrent)
++  const sessionId = props.useSessions?.((state) => state.current) ?? (typeof currentKey === 'string' ? currentKey : null)
++  const metas = useKindMetas(sessionId, props.sessions)
+@@ -530,0 +528 @@ function CadPanelContent(props: {
++          sessionId={sessionId}
+@@ -535 +533 @@ function CadPanelContent(props: {
+-        {active === 'part' ? <PartTabBody meta={metas.part} /> : null}
++        {active === 'part' ? <PartTabBody meta={metas.part} sessionId={sessionId} /> : null}
+@@ -551 +549 @@ function CadPanelContent(props: {
+-export function makeCadPaneBody(sessions: SessionsLike | undefined): (props: CadPaneSeatProps) => JSX.Element {
++export function makeCadPaneBody(sessions: SessionsLike | undefined, currentSession?: CurrentSessionLike): (props: CadPaneSeatProps) => JSX.Element {
+@@ -555 +553 @@ export function makeCadPaneBody(sessions: SessionsLike | undefined): (props: Cad
+-        <CadPanelContent useSessions={props.useSessions} sessions={sessions} />
++        <CadPanelContent useSessions={props.useSessions} sessions={sessions} currentSession={currentSession} />
+@@ -567,2 +565,2 @@ export function makeCadPaneBody(sessions: SessionsLike | undefined): (props: Cad
+-function PartTabBody({ meta }: { meta: CadViewMeta | null }): JSX.Element {
+-  const preview = usePreviewDoc()
++function PartTabBody({ meta, sessionId }: { meta: CadViewMeta | null; sessionId: string | null }): JSX.Element {
++  const preview = usePreviewDoc(sessionId)
+@@ -578 +576 @@ function PartTabBody({ meta }: { meta: CadViewMeta | null }): JSX.Element {
+-  const bound = useActiveDoc()
++  const bound = useActiveDoc(sessionId)
+@@ -603 +601 @@ function PartTabBody({ meta }: { meta: CadViewMeta | null }): JSX.Element {
+-    if (liveUrl !== undefined && previewSnapshot !== null) setPreviewDoc(null)
++    if (liveUrl !== undefined && preview !== null) setPreviewDoc(null)
+diff --git a/src/index.ts b/src/index.ts
+index ba800c2..7617571 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -39,2 +39,2 @@ export function apply(ctx: Context, config: Config = {}): void {
+-  const registry = new DocumentRegistry(process.cwd())
+-  const workspaceRoot = process.cwd()
++  const registry = new DocumentRegistry(root)
++  const workspaceRoot = root
+diff --git a/test/doc-revision.test.ts b/test/doc-revision.test.ts
+index 632c2b0..a6fae50 100644
+--- a/test/doc-revision.test.ts
++++ b/test/doc-revision.test.ts
+@@ -6,2 +6,2 @@
+-import { describe, expect, it } from 'vitest'
+-import { sceneVersion, withDocVersion } from '../client/doc-revision.js'
++import { describe, expect, it, vi } from 'vitest'
++import { sceneVersion, setPollSession, withDocVersion } from '../client/doc-revision.js'
+@@ -34,0 +35,21 @@ describe('scene URL versioning', () => {
++
++describe('session document polling', () => {
++  it('fetches the new session after an older request finishes', async () => {
++    let resolveOld: ((response: Response) => void) | undefined
++    const oldResponse = new Promise<Response>((resolve) => { resolveOld = resolve })
++    const fetchMock = vi.fn()
++      .mockReturnValueOnce(oldResponse)
++      .mockResolvedValue(Response.json({ docs: [] }))
++    vi.stubGlobal('fetch', fetchMock)
++    try {
++      setPollSession('old-session')
++      setPollSession('new-session')
++      expect(fetchMock).toHaveBeenCalledTimes(1)
++      resolveOld?.(Response.json({ docs: [], active: { id: 'old-doc', name: 'Old', version: 1 } }))
++      await vi.waitFor(() => { expect(fetchMock).toHaveBeenCalledWith('/dsh-cad/docs?session=new-session', { cache: 'no-store' }) })
++    } finally {
++      setPollSession(null)
++      vi.unstubAllGlobals()
++    }
++  })
++})
+diff --git a/test/pane-visibility.test.ts b/test/pane-visibility.test.ts
+new file mode 100644
+index 0000000..e551061
+--- /dev/null
++++ b/test/pane-visibility.test.ts
+@@ -0,0 +1,53 @@
++import { describe, expect, it } from 'vitest'
++import { mountCadPanel, type PaneClientContext } from '../client/pane.js'
++
++describe('CAD pane visibility', () => {
++  it('registers only for the selected architecture session and releases on switch', () => {
++    let current = 'standard-session'
++    let preset = 'standard'
++    const listeners = new Set<() => void>()
++    const registered = new Set<string>()
++    const cleanups: Array<() => void> = []
++    const observable = {
++      subscribe(fn: () => void) { listeners.add(fn); return () => { listeners.delete(fn) } },
++    }
++    const context: PaneClientContext = {
++      slots: {
++        inject(_slot, register) { return register() },
++        register() { return () => {} },
++      },
++      get(name) {
++        if (name === 'sidebarRightTabs') return {
++          register(definition: { id: string }) {
++            registered.add(definition.id)
++            return () => { registered.delete(definition.id) }
++          },
++        }
++        if (name === 'uiSession') return { adapter: { current: { ...observable, getSnapshot: () => ({ key: current }) } } }
++        if (name === 'sessions') return { list: {
++          ...observable,
++          getSnapshot: () => ({ byId: { [current]: { projectionValues: { agentPreset: preset } } } }),
++        } }
++        return undefined
++      },
++      effect(fn) {
++        const dispose = fn()
++        cleanups.push(dispose)
++        return dispose
++      },
++    }
++
++    mountCadPanel(context, undefined)
++    expect(registered.size).toBe(0)
++    current = 'architecture-session'
++    preset = 'architecture'
++    for (const listener of listeners) listener()
++    expect(registered.has('dsh-cad')).toBe(true)
++    current = 'standard-session'
++    preset = 'standard'
++    for (const listener of listeners) listener()
++    expect(registered.size).toBe(0)
++    for (const dispose of cleanups.reverse()) dispose()
++    expect(listeners.size).toBe(0)
++  })
++})

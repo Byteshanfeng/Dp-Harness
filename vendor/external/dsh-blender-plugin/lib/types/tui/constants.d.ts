@@ -1,0 +1,10 @@
+export declare const SELECTION_POLL_MS = 100;
+export declare const STATE_POLL_MS = 3000;
+export declare const TOAST_DRAIN_MS = 250;
+export declare const SELECTION_DRAFT_NAME_LIMIT = 24;
+export declare const SUB_DRAFT_INDEX_LIMIT = 12;
+export declare const CHIP_KEY = "selection";
+export declare const MENTION_LIMIT = 50;
+export declare const SCENE_CACHE_MS = 5000;
+export declare const SCENE_CACHE_LIMIT = 1000;
+export declare const NL: string;
