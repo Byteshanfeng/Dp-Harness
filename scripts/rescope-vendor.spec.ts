@@ -40,6 +40,7 @@ it('lists the complete eligible corpus when tracked paths exceed one MiB', () =>
 describe('rescope file selection', () => {
   it('preserves the recorded npm resolution', () => {
     expect(isRescopeExcluded('scripts/dependency-catalog/package-lock.json')).toBe(true)
+    expect(isRescopeExcluded('vendor/external/dsh-cad/package.json')).toBe(true)
   })
 
   it.each([

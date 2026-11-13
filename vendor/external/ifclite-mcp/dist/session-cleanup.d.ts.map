@@ -1,0 +1,1 @@
+{"version":3,"file":"session-cleanup.d.ts","sourceRoot":"","sources":["../src/session-cleanup.ts"],"names":[],"mappings":"AAIA,OAAO,KAAK,EAAE,MAAM,EAAE,aAAa,EAAE,MAAM,cAAc,CAAC;AAE1D,OAAO,KAAK,EAAE,aAAa,EAAE,MAAM,qBAAqB,CAAC;AAEzD,+EAA+E;AAC/E,wBAAgB,uBAAuB,CAAC,MAAM,EAAE,aAAa,EAAE,QAAQ,EAAE,aAAa,EAAE,SAAS,EAAE,MAAM,GAAG,SAAS,EAAE,MAAM,EAAE,MAAM,GAAG,IAAI,CAe3I"}

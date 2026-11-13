@@ -1,0 +1,107 @@
+{
+  "name": "@ifc-lite/mcp",
+  "version": "0.29.0",
+  "description": "Model Context Protocol server for ifc-lite — agent-native BIM via MCP (stdio + Streamable HTTP)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "ifc-lite-mcp": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./server": {
+      "import": "./dist/server.js",
+      "types": "./dist/server.d.ts"
+    },
+    "./protocol": {
+      "import": "./dist/protocol/index.js",
+      "types": "./dist/protocol/index.d.ts"
+    },
+    "./browser": {
+      "import": "./dist/browser.js",
+      "types": "./dist/browser.d.ts"
+    },
+    "./cli-args": {
+      "import": "./dist/cli-args.js",
+      "types": "./dist/cli-args.d.ts"
+    }
+  },
+  "dependencies": {
+    "yjs": "^13.6.33",
+    "@ifc-lite/ai": "^0.2.0",
+    "@ifc-lite/clash": "^2.4.7",
+    "@ifc-lite/collab": "^0.10.0",
+    "@ifc-lite/cache": "^3.7.4",
+    "@ifc-lite/bcf": "^5.2.1",
+    "@ifc-lite/create": "^5.1.3",
+    "@ifc-lite/data": "^6.4.0",
+    "@ifc-lite/diff": "^0.13.1",
+    "@ifc-lite/encoding": "^2.4.0",
+    "@ifc-lite/extensions": "^0.12.0",
+    "@ifc-lite/flow": "^0.7.1",
+    "@ifc-lite/flow-nodes": "^0.12.2",
+    "@ifc-lite/export": "^4.13.3",
+    "@ifc-lite/geometry": "^8.1.0",
+    "@ifc-lite/ids-authoring": "^0.3.4",
+    "@ifc-lite/ifcx": "^4.6.0",
+    "@ifc-lite/merge": "^0.5.0",
+    "@ifc-lite/mutations": "^3.2.0",
+    "@ifc-lite/parser": "^9.9.0",
+    "@ifc-lite/ids": "^3.4.4",
+    "@ifc-lite/query": "^2.5.4",
+    "@ifc-lite/rules": "^0.8.0",
+    "@ifc-lite/sdk": "^9.6.1",
+    "@ifc-lite/viewer-core": "^0.2.28",
+    "@ifc-lite/wasm": "^12.2.0"
+  },
+  "devDependencies": {
+    "@mergifyio/vitest": "^2026.10.11",
+    "@types/node": "^26.6.4",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MPL-2.0",
+  "author": "Louis True",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LTplus-AG/ifc-lite.git",
+    "directory": "packages/mcp"
+  },
+  "homepage": "https://ifclite.dev/docs/",
+  "bugs": "https://github.com/LTplus-AG/ifc-lite/issues",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ifc",
+    "bim",
+    "ai-agent",
+    "llm",
+    "claude",
+    "cursor",
+    "json-rpc",
+    "ifc-lite",
+    "aec"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "pnpm exec tsc",
+    "typecheck": "node ../../scripts/typecheck-tests.mjs",
+    "dev": "pnpm exec tsc --watch",
+    "start": "node dist/cli.js",
+    "test": "vitest run"
+  }
+}

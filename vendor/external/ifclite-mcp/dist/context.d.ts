@@ -1,0 +1,118 @@
+/**
+ * Tool/resource execution context.
+ *
+ * A handler receives `ToolContext` containing:
+ *   - the federated model registry (one or many `BimContext` + `IfcDataStore`)
+ *   - the auth scope of the caller
+ *   - a `ProgressReporter` (no-op when no token is attached)
+ *   - a `Logger` for structured server logs
+ *   - a cancellation signal
+ *
+ * The registry deliberately holds the parsed `IfcDataStore` next to the
+ * `BimContext` because several tools (geometry bbox, audit, schema describe)
+ * need direct store access that the SDK doesn't yet surface as namespaces.
+ */
+import type { BimContext } from '@ifc-lite/sdk';
+import type { IfcDataStore } from '@ifc-lite/parser';
+import type { AuthScope } from './auth/scope.js';
+import type { HeadlessLikeBackend } from './headless-backend.js';
+import type { ViewerManager } from './viewer-manager.js';
+export interface LoadedModel {
+    id: string;
+    name: string;
+    bim: BimContext;
+    store: IfcDataStore;
+    /** Concrete backend, retained so mutation tools can reach the editor without reflection. */
+    backend: HeadlessLikeBackend;
+    filePath?: string;
+    /**
+     * `sourceModelIdentity(name, postUnwrapBytes)` — the same string the viewer
+     * stores as `FederatedModel.sourceFingerprint`, so a `.rules.json` rule set
+     * whose `targets.modelFingerprints` were authored in the viewer resolves to
+     * this model in `check_rules` too (#5138). Absent when the model did not come
+     * from a file this process read (it then matches no fingerprint target).
+     */
+    sourceFingerprint?: string;
+    /**
+     * The parser's `scan:` diagnostics for this model: records the scan dropped
+     * (an unterminated or unescaped string, #3695/#7541) or skipped (#3395).
+     * Absent when every record the file declares was read. Answers about a model
+     * that has them describe less than the file holds, so `model_load` returns
+     * them to the caller (#7610).
+     */
+    scanWarnings?: readonly string[];
+    loadedAt: number;
+}
+export interface ModelRegistry {
+    list(): LoadedModel[];
+    get(id: string): LoadedModel | null;
+    /**
+     * Resolve the model for a tool call.
+     *
+     * Returns the named model when `id` is provided, the single loaded model
+     * when only one is loaded, or null if the caller needs to pick.
+     */
+    resolve(id?: string): LoadedModel | null;
+    add(model: LoadedModel): void;
+    remove(id: string): boolean;
+    count(): number;
+}
+export declare class InMemoryModelRegistry implements ModelRegistry {
+    private models;
+    list(): LoadedModel[];
+    get(id: string): LoadedModel | null;
+    resolve(id?: string): LoadedModel | null;
+    add(model: LoadedModel): void;
+    remove(id: string): boolean;
+    count(): number;
+}
+export interface ProgressReporter {
+    report(progress: number, message?: string, total?: number): void;
+}
+export declare const NOOP_PROGRESS: ProgressReporter;
+export type LogLevel = 'debug' | 'info' | 'notice' | 'warning' | 'error' | 'critical';
+export interface Logger {
+    log(level: LogLevel, message: string, data?: Record<string, unknown>): void;
+}
+export declare const SILENT_LOGGER: Logger;
+/**
+ * Who is calling, transport-wise. Multi-client transports (Streamable HTTP)
+ * run one `MCPServer` per session, and per-session state — the layer
+ * workspace in particular (#1030) — keys off `id`.
+ */
+export interface SessionIdentity {
+    /** Transport session id; undefined for stdio/in-process (local mode). */
+    id?: string;
+    /** Authenticated user identity from `AuthScope.user`; undefined when unauthenticated. */
+    principal?: string;
+}
+export interface ToolContext {
+    registry: ModelRegistry;
+    scope: AuthScope;
+    /** Live authorization for operations that await source materialization. */
+    currentScope?: () => AuthScope;
+    progress: ProgressReporter;
+    log: Logger;
+    /** Honoured by long-running tools; aborts when client cancels. */
+    signal: AbortSignal;
+    /** Server-wide config (read-only flag, bSDD endpoint, allowed paths, …). */
+    config: ServerConfig;
+    /** Transport session + principal; absent only in hand-rolled test contexts. */
+    session?: SessionIdentity;
+    /** Optional: present when the server has a managed in-process viewer. */
+    viewer?: ViewerManager;
+}
+export interface ServerConfig {
+    readOnly: boolean;
+    bsddEndpoint?: string;
+    /** Glob patterns the stdio server is allowed to read from. */
+    allowedPaths?: string[];
+    /** Sampling capability is opt-in per spec §10. */
+    samplingEnabled: boolean;
+    /** When true, the MCP CLI auto-opens the viewer at startup. */
+    autoOpenViewer?: boolean;
+    /** Preferred viewer port (0 = auto). */
+    viewerPort?: number;
+}
+export declare const DEFAULT_CONFIG: ServerConfig;
+//# sourceMappingURL=context.d.ts.map

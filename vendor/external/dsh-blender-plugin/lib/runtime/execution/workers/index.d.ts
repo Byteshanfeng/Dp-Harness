@@ -1,0 +1,20 @@
+import type { WorkerRecord } from './api.js';
+import { workerSnapshot } from './api.js';
+import type { WorkersDeps } from './api.js';
+export type { WorkersDeps, WorkerRecord } from './api.js';
+export type { WorkerInfo } from './worker-start.js';
+export declare function createWorkersApi(E: WorkersDeps): {
+    workerStart: (opts?: Record<string, unknown>, nameArg?: unknown) => Promise<Record<string, unknown>>;
+    workerExec: (code: string, timeoutMs?: number, purgePrefixes?: unknown, nameArg?: unknown) => Promise<Record<string, unknown>>;
+    workerSee: (spec: unknown, nameArg?: unknown) => Promise<Record<string, unknown>>;
+    workerWatch: (spec: unknown, nameArg?: unknown) => Promise<Record<string, unknown>>;
+    workerReset: (nameArg?: unknown) => Promise<Record<string, unknown>>;
+    workerStatus: (nameArg?: unknown) => Promise<Record<string, unknown>>;
+    workerStop: (nameArg?: unknown) => Promise<Record<string, unknown>>;
+    workerRestart: (nameArg?: unknown, opts?: Record<string, unknown>) => Promise<Record<string, unknown>>;
+    workerList: () => Record<string, unknown>[];
+    workerSnapshot: typeof workerSnapshot;
+    workerState: (name: unknown) => WorkerRecord;
+    clearWorkerReaper: () => void;
+    killWorkers: () => void;
+};

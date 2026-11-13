@@ -1,0 +1,1 @@
+{"version":3,"file":"bcf-publication.d.ts","sourceRoot":"","sources":["../../src/tools/bcf-publication.ts"],"names":[],"mappings":"AAOA,OAAO,KAAK,EAAE,WAAW,EAAE,MAAM,eAAe,CAAC;AAGjD,OAAO,KAAK,EAAE,IAAI,EAAE,MAAM,YAAY,CAAC;AAGvC,gFAAgF;AAChF,wBAAgB,uBAAuB,CAAC,GAAG,EAAE,WAAW,EAAE,sBAAsB,UAAO,GAAG,MAAM,GAAG,SAAS,CAO3G;AA6GD,eAAO,MAAM,mBAAmB,EAAE,IAAI,EAA4C,CAAC"}

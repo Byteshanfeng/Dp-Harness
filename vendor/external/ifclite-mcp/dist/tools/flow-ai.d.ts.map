@@ -1,0 +1,1 @@
+{"version":3,"file":"flow-ai.d.ts","sourceRoot":"","sources":["../../src/tools/flow-ai.ts"],"names":[],"mappings":"AAIA,mFAAmF;AACnF,OAAO,EAAmB,KAAK,UAAU,EAAqB,MAAM,cAAc,CAAC;AAEnF,OAAO,EAAc,KAAK,aAAa,EAAE,MAAM,yBAAyB,CAAC;AAGzE,wBAAgB,eAAe;;;;EAI9B;AAED,wBAAgB,SAAS,CAAC,MAAM,EAAE,UAAU,EAAE,QAAQ,EAAE,OAAO,EAAE,EAAE,OAAO,EAAE,MAAM,IAAI,GAAG,aAAa,GAAG,SAAS,CAQjH"}

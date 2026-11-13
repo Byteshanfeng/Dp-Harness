@@ -1,0 +1,16 @@
+allowBuilds:
+  sharp: true
+# pnpm v11 defaults minimumReleaseAge to 1440 minutes: freshly published
+# versions are not resolved for 24h, so dev installs silently keep old ones.
+# Bare names / org patterns exempt every future version; a `name@x.y.z` entry
+# exempts only that one version and goes stale on the next release.
+minimumReleaseAgeExclude:
+  - '@deepseek-ai/*'
+
+# potrace -> Jimp 0.14 accepts phin's callback API; pin the patched major so
+# Jimp cannot retain the vulnerable redirect/header implementation (GHSA-x565-32qp-m3vf).
+overrides:
+  phin: 3.7.1
+  follow-redirects: 1.16.2
+  # DSH 0.2.1-rc.5 dev fixtures otherwise pull vulnerable zod@4.4.3 (GHSA-mrhx-c7xc-m3w5).
+  zod: 4.6.7

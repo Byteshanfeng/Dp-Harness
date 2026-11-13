@@ -1,22 +1,13 @@
 /**
- * Render the install icons of the Web application from the official
- * application tile.
+ * 从图灵 Harness 的 Web 图标底图生成安装图标。
  *
- * A browser installs a Web App only with a raster 192px and a 512px icon, masks
- * the icon it puts on the home screen, and has no manifest support for iOS,
- * which reads `apple-touch-icon` instead. The whale favicon is the bare mark
- * drawn edge to edge: handed to a launcher directly it loses its fins to the
- * mask, and it carries neither the tile nor a background of its own. This
- * script rasterizes the official application tile (`apps/desktop/resources/icon.svg`,
- * the artwork the desktop application ships) into the committed PNGs under
- * `public/`. Every variant crops the tile's drop shadow, which belongs to a
- * desktop window rather than a launcher; the maskable variant additionally
- * scales the whale inside the safe zone a platform mask may crop, leaving the
- * tile's own gradient to fill the icon so no mask meets a seam.
+ * 浏览器安装 Web 应用需要 192px 和 512px 位图；iOS 读取独立的
+ * `apple-touch-icon`。网页 favicon 使用单独的字标，安装图标使用
+ * `apps/web/branding/turing-tile.svg` 的完整底色。生成时裁去外层阴影，
+ * 遮罩版本还会把 T 字标缩进平台保证可见的区域。
  *
- * The committed PNGs are the output; rerun
- * `pnpm --filter @deepseek-ai/dsh-web-frontend run render:app-icons` after the
- * tile artwork changes.
+ * 提交的 PNG 是输出；底图变化后运行
+ * `pnpm --filter @deepseek-ai/dsh-web-frontend run render:app-icons` 重新生成。
  * @module render-app-icons
  */
 
@@ -25,8 +16,8 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
 
-/** Vector source owned by the desktop application; 1104 units square with the tile inset. */
-export const TILE_SOURCE = fileURLToPath(new URL('../../desktop/resources/icon.svg', import.meta.url))
+/** Web 图灵品牌底图，包含 1024 单位的方形图标区域。 */
+export const TILE_SOURCE = fileURLToPath(new URL('../branding/turing-tile.svg', import.meta.url))
 
 /** Directory the generated PNGs are committed to. */
 export const ICON_OUTPUT_DIRECTORY = fileURLToPath(new URL('../public/', import.meta.url))
@@ -47,10 +38,8 @@ const SOURCE_DENSITY = 72
 const RENDER_SCALE = 4
 
 /**
- * Fraction of a maskable icon the artwork keeps: the platform may crop the
- * border outside it. The tile's own ink reaches 0.461 of its edge from the
- * centre, so 0.868 is the largest scale a circular mask still shows whole;
- * `pwa-manifest.e2e.ts` checks the committed artwork against that circle.
+ * 遮罩版本保留的字标比例。缩放后字标位于平台保证可见的圆内；
+ * `pwa-manifest.e2e.ts` 会检查已提交图标。
  */
 export const MASKABLE_ARTWORK_SCALE = 0.82
 
@@ -63,7 +52,7 @@ const SOURCE_ROOT = /^<svg[^>]*>/u
 /** The tile group's drop shadow; stripped because a launcher icon has no window around it. */
 const TILE_SHADOW_GROUP = '<g filter="url(#filter0_d_1637_371)">'
 
-/** The whale group inside the tile; the only element a maskable icon scales. */
+/** 底图中的 T 字标识组；遮罩图标只缩放这一组。 */
 const TILE_ARTWORK_GROUP = '<g filter="url(#filter1_ddi_1637_371)">'
 
 /** One committed install icon: the manifest or link member it serves and its edge in pixels. */
@@ -113,7 +102,7 @@ function reparent(source: string): string {
 
 /**
  * Rewrite the tile source so the icon canvas is exactly the tile.
- * @param source - complete `icon.svg` document.
+ * @param source - 完整的 `turing-tile.svg` 文档。
  * @returns an SVG document whose 1024-unit square is the tile without its shadow.
  */
 export function tileDocument(source: string): string {
@@ -123,8 +112,8 @@ export function tileDocument(source: string): string {
 /**
  * Rewrite the tile source into a maskable icon. The tile keeps its own gradient
  * and extent, so the icon's border is the real tile rather than an extension;
- * only the whale scales into the safe zone a platform mask may crop.
- * @param source - complete `icon.svg` document.
+ * 仅把 T 字标缩进平台保证可见的区域，底色保持完整。
+ * @param source - 完整的 `turing-tile.svg` 文档。
  * @returns an SVG document whose artwork survives a circular mask whole.
  */
 export function maskableDocument(source: string): string {
@@ -165,7 +154,7 @@ function documentForVariant(source: string, kind: AppIconVariant['kind']): strin
 
 /**
  * Render every install icon from the tile source.
- * @param source - complete `icon.svg` document.
+ * @param source - 完整的 `turing-tile.svg` 文档。
  * @returns one PNG per {@link APP_ICON_VARIANTS} entry, in declaration order.
  */
 export async function renderAppIcons(source: string): Promise<readonly { variant: AppIconVariant; png: Buffer }[]> {

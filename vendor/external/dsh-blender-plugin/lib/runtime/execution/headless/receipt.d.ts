@@ -1,0 +1,45 @@
+import type { ArtifactCollection, ExpectEval, FailureClass, FailureContext, OutJsonInfo, ShotsSummary } from './result.js';
+import type { HeadlessRunRec, ScriptFileInfo, SpawnResult } from './types.js';
+import type { BuiltHeadlessScript } from './script.js';
+export interface HeadlessReceiptInput {
+    ok: boolean;
+    runId: string;
+    session: string;
+    pluginVersion: string | null;
+    expect: ExpectEval | null;
+    runRec: HeadlessRunRec;
+    stdout: string;
+    stderr: string;
+    status: FailureClass;
+    failureHint: string | null;
+    ledgerWin: string;
+    scriptFile: ScriptFileInfo | null;
+    inputFile: unknown;
+    outJson: OutJsonInfo;
+    result: unknown;
+    parseError: {
+        message: string;
+        line: string;
+    } | null;
+    shots: ShotsSummary | null;
+    pathWarnings: unknown[];
+    ms: number;
+    timeoutMs: number;
+    outdirWin: string;
+    outdirWsl: string | null;
+    childEnvKeys: string[];
+    res: SpawnResult;
+    logs: HeadlessRunRec['logs'];
+    failure: FailureContext;
+    artifacts: ArtifactCollection;
+    noiseFiltered: number;
+    blenderExe: string | null;
+    built: BuiltHeadlessScript;
+    preload: unknown[] | undefined;
+    gpu: Record<string, unknown> | null;
+    engine: unknown;
+    engineMode: unknown;
+    useUserConfig: boolean;
+    resultTruncated: boolean;
+}
+export declare function buildHeadlessReceipt(r: HeadlessReceiptInput): Record<string, unknown>;

@@ -1,0 +1,1 @@
+{"version":3,"file":"headless-backend.d.ts","sourceRoot":"","sources":["../src/headless-backend.ts"],"names":[],"mappings":"AAIA,OAAO,EAAE,eAAe,EAAE,MAAM,wBAAwB,CAAC;AACzD,OAAO,KAAK,EAAE,YAAY,EAAE,MAAM,kBAAkB,CAAC;AAIrD,OAAO,EAAE,WAAW,EAAE,aAAa,EAAE,MAAM,wBAAwB,CAAC;AAEpE,sFAAsF;AACtF,qBAAa,mBAAoB,SAAQ,eAAe;gBAC1C,KAAK,EAAE,YAAY,EAAE,SAAS,EAAE,MAAM,EAAE,OAAO,EAAE,MAAM;CAMpE"}

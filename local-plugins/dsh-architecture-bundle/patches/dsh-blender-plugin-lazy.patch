@@ -1,0 +1,13 @@
+diff --git a/lib/plugin-lifecycle.js b/lib/plugin-lifecycle.js
+--- a/lib/plugin-lifecycle.js
++++ b/lib/plugin-lifecycle.js
+@@ -14,7 +14,7 @@ export function registerLifecycle(ctx, port, autoStart) {
+     //   EADDRINUSE 退出 → 每 15 s 空转一次、永不自愈（现场：后端事件循环被长时间同步操作占死，
+     //   /health 不应答、连 SIGTERM 都排不上队）。probe 超时只有 1500ms，所以连续 2 次（≈30s）
+     //   失败才认定卡死，避免把"只是忙"的后端杀掉。
+     let probeMisses = 0;
+-    ctx.effect(() => {
++    if (autoStart) ctx.effect(() => {
+         const wd = setInterval(() => {
+             void (async () => {
+                 try {

@@ -1,0 +1,17 @@
+node_modules/
+.reference/
+*.tgz
+.DS_Store
+test/visual/visual-bundle.js
+test/visual/scene-3d-model.json
+test/visual/scene-3d-snowman.json
+.dsh-cad/
+.zcode/
+docs/marketing/
+/*.step
+/*.stl
+/*.dxf
+/*.svg
+__pycache__/
+test/visual/swap-check.js
+test/visual/ctx-stress.js

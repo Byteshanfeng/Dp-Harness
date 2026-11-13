@@ -1,0 +1,318 @@
+# dsh-cad — CAD Plugin for DeepSeek Harness
+
+![dsh-cad banner](docs/img/banner.svg)
+
+[![homepage](https://img.shields.io/badge/homepage-dsh--cad-4D6BFE)](https://lau-mars.github.io/dsh-cad/)
+[![npm](https://img.shields.io/npm/v/dsh-cad)](https://www.npmjs.com/package/dsh-cad)
+[![downloads](https://img.shields.io/npm/dm/dsh-cad)](https://www.npmjs.com/package/dsh-cad)
+[![dsh](https://img.shields.io/npm/v/@deepseek-ai%2Fdsh?label=dsh)](https://www.npmjs.com/package/@deepseek-ai/dsh)
+[![Node](https://img.shields.io/badge/node-%3E%3D%2022-4D6BFE)](https://nodejs.org/)
+[![occt](https://img.shields.io/badge/occt-7.9.3-4D6BFE)](https://github.com/LAU-MARS/opencascade-ts)
+[![occt.ts](https://img.shields.io/npm/v/occt.ts?label=occt.ts)](https://www.npmjs.com/package/occt.ts)
+[![ansatz](https://img.shields.io/npm/v/ansatz-wasm?label=ansatz)](https://www.npmjs.com/package/ansatz-wasm)
+[![License: MIT](https://img.shields.io/badge/license-MIT-4D6BFE)](./LICENSE)
+
+English | [简体中文](./README.zh-CN.md)
+
+A CAD plugin for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness):
+an **embedded 3D/2D CAD viewer** plus a **native parametric modeling tool family**
+(OCCT kernel) in the Web UI, letting the agent build and inspect CAD geometry
+step by step — "model while you watch".
+
+## Preview
+
+A full modeling session, end to end: the agent builds a parametric assembly
+from plain chat — a 120×80×8 base plate with R5 rounded corners, then four
+bolt instances placed at the corners — while the resident CAD panel tracks
+every step live (parts tree with per-instance colors, ViewCube, "装配体"
+assembly tab, 5 instances · 1,740 triangles). The finished assembly exports
+as a structured STEP document and the agent verifies it by reading the file
+back — 2 solids, 3 products, 2 assembly usages, 1,125.00 mm³:
+
+![dsh-cad assembly session](docs/img/assembly-preview.png)
+
+## Downloads
+
+Cumulative downloads from the npm registry, refreshed daily by CI:
+
+![npm cumulative downloads](docs/img/downloads-cumulative.svg)
+
+## Feature Overview
+
+| Capability | Description |
+| --- | --- |
+| ⚙️ Kernel chain: cadorange → occt.ts | Modeling goes through **[cadorange](https://github.com/LAU-MARS/cadorange)** (the agent-native CAD runtime wrapping the occt.ts/OCCT WASM; public API + the supported `cadorange/occt` escape hatch for meshing/HLR/wire construction); the direct occt.ts adapter stays as the fallback tier — `DSH_CAD_KERNEL` pins one explicitly (the opencascade.js tier was removed in v0.15.1, −64MB install). The old "no editing after shell" seam is gone — fillet/chamfer/boolean keep working after shelling |
+| 🔍 CAD viewing | STL / OBJ / STEP / IGES / BREP / DCPRT (3D), DXF / SVG (2D); interactive viewport in the resident right panel (orbit / zoom / wireframe / pan), with a one-line result row in the conversation |
+| 🌗 Dark-mode surfaces | Every rendered surface follows the host theme — viewport slab, DXF/drawing strokes, the Three.js grid / XYZ triad / feature edges / default mesh color / sketch overlays, and the ViewCube plate; a theme flip restyles mounted viewers live. Overrides: `--dsh-cad-bg`, `--dsh-cad-stroke`, `--dsh-cad-paper` |
+| 🧭 CAD editor interactions | Onshape-style ViewCube (26-zone click-to-orient), hover/click face & edge picking with live measurement (area mm² / length mm), Faces+Edges / Faces / Wireframe render modes, switchable BRep demo parts (bracket / flange / shaft) |
+| 🏗️ Parametric modeling | Primitives, profile extrusion, **loft**, **sweep**, **revolve**, booleans, all-edge fillet/chamfer, **shell**, **draft**, **patterns** (linear/circular), transforms; profiles take **curve segments** (arcs/circles exact BRep; B-splines sampled approximation) — exact OCCT BRep, not a mesh approximation. `cad_loft` sections accept **curves** too: point loops, `{through}` splines or planar `{profile}` chains; `smooth: true` fits a **periodic B-spline** through point loops — one continuous B-spline lateral face instead of planar strips meeting at G0 creases |
+| ✏️ Named sketches | Standalone named profiles (Sketch1…) kept in the document (`cad_sketch_new` / `edit` / `list` / `delete`); extrude/revolve/sweep reference them **by name**, and `cad_sketch_edit` rewrites the definition in place + replays the log, rebuilding every dependent feature — the parametric loop. Sketches render as Onshape-style **blue curves + plane frame** in the viewport (refreshing live on edit), listed in a left-side **feature tree** (sketches + features, eye-toggle visibility, click-to-highlight bodies) over the Part tab |
+| 🗂️ Codex-style document tabs | The resident display panel gets a tab strip with a "+" menu: **Part** (Part Studio, the default) / **Assembly** (instance insert/move/remove) / **Drawing** (true hidden-line sheets); tabs are closable and keep their state |
+| 🔩 Joint-driven assemblies | The build123d joint family (rigid/revolute/linear/cylindrical/ball/planar/polar): `cad_assembly_joint` defines, `cad_assembly_connect` pairs-and-solves (parent fixed, child repositioned onto the joint frames), `cad_assembly_drive` drives motion values with cascading re-solve (motion studies), `cad_assembly_explode` for exploded views; the assembly-tree panel gains a JOINTS section (kind/current value/pairing link). Pure main-thread placement algebra — kernel-independent, replays from the op log |
+| 📥 STEP assembly import | `cad_step_import` imports a STEP document as an assembly: names, nesting and instance placements survive, identical geometry dedupes into one body referenced by N instances (a bolt pattern is one body); files cache as content-addressed workspace assets so op-log replay stays self-contained (cadorange kernel) |
+| 📁 Multi-document file space | Named documents per workspace (`.dsh-cad/docs/`), each session bound to its own active document — new sessions start empty instead of inheriting leftovers; a folder button in the panel lists every document (preview / delete), and `cad_doc_new` / `cad_doc_open` manage the modeling target from chat |
+| 📐 Engineering drawings | GB first-angle layout: front / top / left views + isometric, true OCCT hidden-line removal via the **occt.ts** kernel (an npm dependency, dashed); sheet frame, title block, overall dimensions, standard scale series; exports SVG / DXF |
+| 🔗 Constraint solving & motion | **Ansatz** geometric constraint solver (**one command: `npm install ansatz-wasm`** — a wasm dependency, no Rust toolchain, no native binary): entity/constraint modeling (assembly instances ↔ rigid3 poses mapped automatically), solve-with-writeback, full DOF/residual/redundancy/suggestion diagnostics (LLM-oriented), and parametric kinematic sweeps (`cad_constraint` / `cad_solve` / `cad_motion`) |
+| 📐 Geometry measurement | Exact volume (mm³), bounding box, triangle counts, DXF layers |
+| 📤 On-demand export | STEP (parametric) / STL (mesh); files are written only when the user asks |
+| 🖥️ Resident CAD panel | Open CAD from the right sidebar when needed; a new session keeps the sidebar closed. Its Part / Assembly / Drawing tabs track that session's model while modeling. A host-independent liveness poll (`GET /dsh-cad/docs` → per-document op count) keeps the viewport following modeling ops even when the conversation meta pipeline goes stale, and auto-returns from a file preview |
+| ⚡ Zero-copy render pipeline | worker mesh → in-memory binary → three.js typed arrays; zero base64 / zero intermediate files / zero per-step disk writes |
+| 💾 Modeling document persistence | Operation log (JSON) + debounced disk mirror; automatically replayed to restore state after a process restart |
+| 🖼️ Image → profile | PNG sketch/screenshot → Otsu binarization → contour tracing → extrusion-ready polygon (`cad_image_profile`) |
+| 🔌 FreeCAD executor | Run the same op family on an external FreeCAD console (STEP in/out); requires a local FreeCAD install |
+| ☁️ Onshape executor | Run the same op family on **Onshape** over its signed REST API — zero local install; every op compiles to a **standard Onshape feature** pushed into the target Part Studio (no Feature Studio setup). Readback is three-tier: cheap per-part STL by default, `readback: "step"` for exact-BRep-derived named meshes via a server-side STEP translation, or `readback: "none"` — build only and return the document link (~3 calls, quota-friendliest). Exports `.stl` / `.step` / `.x_t` (Parasolid). Quota-aware errors distinguish credential problems from free-plan cooldowns; the Onshape document URL is always surfaced |
+
+## Installation
+
+The plugin is published to npm — one line:
+
+```sh
+dsh plugin --profile web add dsh-cad
+```
+
+The installer applies the bundled `cordis.patch.yml` (declared in the `dsh.bundle` manifest) automatically, so there is nothing to configure by hand.
+
+### Version requirements
+
+- **Node.js** and **dsh CLI** (`@deepseek-ai/dsh`): minimum versions live in
+  the badge row above and the `engines` field of `package.json` — kept out of
+  the prose so they never go stale
+
+### Install from source (dev mode)
+
+```sh
+git clone https://github.com/LAU-MARS/dsh-cad.git
+cd dsh-cad
+npm install && npm run build && npm test   # deps include occt.ts (true-HLR drawing kernel, ~20MB wasm)
+
+npm install -g @deepseek-ai/dsh pnpm
+dsh web                                  # let the first launch init the profile, then Ctrl-C
+
+dsh plugin --profile web add /path/to/dsh-cad
+
+dsh web
+```
+
+The patch insert ships as `cordis.patch.yml` in the package root and is applied by the installer via the same `dsh.bundle` manifest.
+
+Set `DEEPSEEK_API_KEY` and you are ready — for example:
+
+- “open bracket.stl” → `cad_view`
+- “model a 100×60×5 plate, punch a ⌀20 hole in the middle, R2 fillets on the four
+  corners, add a ⌀16 boss 20 tall, export plate.step”
+  → `cad_create_prim` + `cad_boolean` + `cad_fillet` + `cad_export`, with the 3D tab
+  updating live at every step
+- “build a snowman” → spheres + a cone nose + a cylinder hat (precise `at`/`axis` placement)
+- “add two more b1, one rotated 90 degrees” → `cad_assembly_insert` + `cad_assembly_move`, the Assembly tab updates live
+- “make an A3 drawing of b1 and export dxf” → `cad_drawing` (three views + iso + dashed hidden lines + dimensions) → `cad_export` `.dxf`
+
+## Modeling Tool Family
+
+| Tool | Description |
+| --- | --- |
+| `cad_view` | Open a CAD file and render it in the viewer (resident panel) |
+| `cad_info` | Read-only geometry metadata (format / counts / bounding box / units / layers) |
+| `cad_create_prim` | Primitives (mm, Z-up); `at` for placement, `axis` for orientation (exact axis-angle rotation) |
+| `cad_sketch_new` | Create a named sketch (Sketch1…): {start, segments} / {circle} / flat points loop — referenced by name from the profile features |
+| `cad_sketch_edit` | Redefine a sketch (回改): the definition op is rewritten in place and the log replayed — every referencing feature rebuilds |
+| `cad_sketch_list` | List the document's sketches (name / form / size) |
+| `cad_sketch_delete` | Delete a sketch (refused while features still reference it) |
+| `cad_extrude_profile` | Extrude a closed XY-plane profile along +Z into a solid — inline points/segments/circle or a named sketch (`sketch`) |
+| `cad_loft` | Loft: skin a solid through successive closed sections (each a [x,y,z,…] loop in its own plane, or a curve/`profile` section); sections may differ in shape and point count; `smooth` fits a periodic B-spline through point loops for a **crease-free** skin; `ruled` for straight sides |
+| `cad_revolve` | Solid of revolution: revolve a closed profile around an axis (profile coords = (radius, height); curve segments supported — rounded rims exact); optional `angle`; accepts a named sketch |
+| `cad_chamfer` | Chamfer: bevel every sharp edge with one equal distance (mm) |
+| `cad_pattern` | Pattern: linear (`delta` spacing) or circular (principal axis + `at` point + sweep angle); creates copy bodies, fuse afterwards for one body |
+| `cad_shell` | Shell: hollow to a wall thickness (inward, outer skin preserved); `open` lists outward normals of the faces to open (empty = sealed). Runs on the occt.ts kernel; the result is a HOSTED body |
+| `cad_draft` | Draft: tilt the walls `angle` degrees about a neutral plane (mold release); `direction` is the pull direction, walls auto-selected by default. Runs on the occt.ts kernel; the result is a HOSTED body |
+| `cad_sweep` | Sweep: pipe a closed 2D profile along a 3D [x,y,z,…] path; the profile is auto-placed on the start plane, so no manual orientation; accepts a named sketch |
+| `cad_boolean` | fuse / cut / common (classic hole punching: plate cut cylinder) |
+| `cad_fillet` | Constant-radius fillet on all sharp edges |
+| `cad_transform` | Translate / Euler rotate / mirror |
+| `cad_volume` | Exact BRep volume (mm³) |
+| `cad_drawing` | Engineering drawing: front/top/left + isometric views, dashed hidden lines, frame, title block, overall dimensions, standard scale, A4/A3 |
+| `cad_assembly_insert` | Insert a body into the assembly as a placed instance (`at` position, `rotate` orientation) |
+| `cad_assembly_move` | Set an instance's absolute placement |
+| `cad_assembly_remove` | Remove an instance from the assembly (the body stays) |
+| `cad_assembly_joint` | Define a joint on an instance (build123d family: rigid/revolute/linear/cylindrical/ball/planar/polar), frame in the instance's local coordinates |
+| `cad_assembly_connect` | Pair joints to place a child: the parent stays fixed, the child is repositioned so both joint frames coincide (optional connect-time drive value) |
+| `cad_assembly_drive` | Drive a joint's motion value and re-solve every pairing (one motion-study step; ranges enforced) |
+| `cad_assembly_solve` | Re-solve all pairings at current joint values (after moving a parent manually) |
+| `cad_assembly_explode` | Exploded-view factor (instances push radially from the assembly center; view-state only, exports/drawings stay assembled) |
+| `cad_assembly_info` | Read the assembly state: placements + joint labels/types/values + pairings + explode factor |
+| `cad_step_import` | Structured STEP import: names, part structure and placements survive; identical geometry dedupes into one body referenced by N instances |
+| `cad_constraint` | Declare the constraint model: entities (assembly-instance bindings) + constraints (distance/angle/mate/coaxial…), persisted in the op log |
+| `cad_solve` | Solve with Ansatz and write poses back; returns DOF/residual/redundancy/suggestion diagnostics |
+| `cad_motion` | Kinematic sweep: drive one constraint value from `from` to `to`, solve frame by frame, apply the last pose, return the motion table |
+| `cad_export` | Export STEP / STL / DCPRT (the native replayable part document) to a workspace path; `target: "assembly"` writes the assembly STEP, `target: "drawing"` writes the sheet as SVG / DXF |
+| `cad_delete` | Delete a body |
+| `cad_docs` | List the workspace's modeling documents (id / name / bodies / updated, active marked) |
+| `cad_doc_new` | Create a named document and make it the session's modeling target (start multi-part projects here) |
+| `cad_doc_open` | Open an existing document (by id or name) as the session's modeling target — bodies replay exactly |
+| `cad_doc_rename` | Rename a document |
+| `cad_doc_delete` | Permanently delete a document (requires `confirm: true`) |
+| `cad_freecad` | Run an op program on an external FreeCAD executor (optional STEP input / export) |
+| `cad_fusion` | Run an op program on an external Fusion 360 executor (GUI bridge; optional export) |
+| `cad_onshape` | Run an op program on the Onshape cloud (signed REST API): creates or drives a document, returns its URL; `readback: "step"` for exact BRep meshes; exports `.stl` / `.step` / `.x_t` (Parasolid) |
+| `cad_image_profile` | PNG → contours → extrusion-ready polygon points |
+| `cad_script` | Deterministic script evaluation for geometry math (profile point arrays, arc coordinates): `js` runs in-process (Node vm — works even when the host shell is unavailable), `py` uses a system Python |
+
+After every modeling step: **the chat result row updates in place** (stable viewId +
+versioned URL), and the resident panel's "Part" tab tracks the latest model in real time.
+
+## Connectors (roadmap)
+
+Modeling runs on the **occt.ts kernel** via cadorange (OCCT in the browser —
+zero install). The connectors below refer to **external CAD engines** acting as
+executors for the same tool family, planned for future support:
+
+| Connector | Suite | Platform | Status |
+| --- | --- | --- | --- |
+| **Built-in kernel** | CAD modeling kernel based on OCCT + WebGL, runs in the browser — zero install | All platforms (WebGL rendering) | ✅ Built-in |
+| FreeCAD | open-source parametric suite — natural local executor via its Python API (console + GUI window modes) | Windows / macOS / Linux | ✅ Available (needs local install) |
+| Fusion 360 | Autodesk CAD/CAM — resident add-in + spool bridge (no headless; the Fusion window doubles as a viewer) | Windows / macOS | 🧪 Experimental (`cad_fusion`) |
+| SolidWorks | Dassault Systèmes industry-standard 3D CAD, COM/.NET automation | Windows only | 🚧 Windows demo scaffold (`scripts/solidworks-bridge/`) |
+| Onshape | PTC cloud-native SaaS CAD, fully in the browser — signed REST API (cad.onshape.com or chamber hosts); every op compiles to a standard Onshape feature pushed into the Part Studio, results read back as per-part STL + mass properties, the cloud is the viewer | All platforms (browser) | ✅ Available (`cad_onshape`; set `DSH_ONSHAPE_ACCESS_KEY` / `DSH_ONSHAPE_SECRET_KEY`) |
+| ZW3D（中望3D） | ZWSOFT all-in-one CAD/CAM | Windows / Linux | 🚧 Planned |
+| GstarCAD 3D（浩辰3D） | Gstarsoft 3D CAD | Windows | 🚧 Planned |
+
+All external engines implement the same **GeometryExecutor contract** (`available()` /
+`run(opProgram) → meshes`), so the WebGL display layer never changes — swapping a
+backend changes only the quality of the produced geometry.
+
+## Architecture
+
+```
+cad_view(path)                        modeling tools (cad_create_prim, …)
+  → import worker (occt-import-js)      → modeling worker (occt.ts WASM via cadorange)
+  → CadScene JSON (base64-f32)          → exact BRep geometry + meshing
+  → GET /dsh-cad/scene/<id>            → in-memory binary scene (f32/u32 packed)
+                                        → GET /dsh-cad/bin/<docId>
+            ↓ session presentationMeta (viewId + versioned URL) ↓
+        browser card + persistent "3D" tab (three.js / SVG, Z-up, XYZ axes)
+```
+
+- **Two workers**: import (occt-import-js, read-only STEP/IGES/BREP) and modeling
+  (cadorange over the occt.ts wasm) are separate, both lazily started
+- **Zero-copy pipeline**: modeling scenes use zero base64 / zero large JSON arrays /
+  zero per-step disk writes (disk mirror debounced 1.5s, replayed only on service
+  restart); `cad_export` is the only explicit file export
+- **Modeling document**: `<workspace>/.dsh-cad/model.json` operation log; all bodies
+  are restored by replay after a restart
+- **Drawing HLR kernel**: hidden lines run on **occt.ts** (npm dependency,
+  `npm i occt.ts`) — true OCCT removal, no fallback engine, a missing kernel is
+  a hard error. Kernel APIs: `hiddenLines()` true hidden-line
+  removal, byte-level STEP/BRep `readStep`/`readBrep`/`writeStep`/`writeBrep`
+  without MEMFS, tessellation with built-in feature-edge extraction, and a
+  `hasError()`/`lastError()` error contract. Geometry crosses kernels as STEP
+  bytes and the projected segments are remapped into the sheet frame. Kernel
+  dist resolution: `DSH_OCCTJS_DIST` env var → Node's own resolution of the
+  `occt.ts` dependency (walks up every parent node_modules — npm/yarn flat and
+  pnpm symlink layouts all hit) → `<repo>/../opencascade-ts/dist` (sibling
+  checkout) → `vendor/` → `node_modules/opencascade-ts`
+- **Constraint solving (Ansatz)**: the solver is the npm dependency
+  **`ansatz-wasm`** (a wasm-bindgen build, single package ~538KB, zero deps) —
+  installing dsh-cad pulls it automatically, and `npm install ansatz-wasm` alone
+  upgrades it. **No Rust toolchain, no native binary, platform independent.**
+  Resolution: the npm package (node_modules) → a `DSH_ANSATZ_WASM` directory → a
+  sibling Ansatz checkout's pkg-node. The solver speaks one JSON envelope
+  contract, with tool-layer errors (e.g. `unsupported_constraint`) surfaced
+  verbatim for the LLM. Assembly placements (translate + XYZ Euler
+  degrees) map bidirectionally to the solver's rigid3 poses (translate +
+  exponential-map rotation, radians). Solver capability is staged
+  (point-distance-to-origin today) — the plumbing contract is finished and needs
+  no changes as it grows
+- **Kernel chain**: modeling goes through **cadorange** (agent-native CAD
+  runtime; public build123d-style API for prims/curve-segment profiles (TRUE
+  B-spline interpolation)/loft/sweep/revolve/booleans (cleaned by default)/
+  fillet/chamfer/shell/draft/native mirror/centroid, plus the supported
+  `cadorange/occt` escape hatch for viewer tessellation, engineering-drawing
+  HLR (zero STEP hops, one wasm session) and wire construction); the direct
+  occt.ts adapter stays as the fallback tier (`DSH_CAD_KERNEL` pins one; see
+  docs/cadorange-integration.md for the verb-by-verb mapping). Editing after
+  shelling is seamless. Assembly STEP export writes a **structured document**
+  (cadorange
+  `exportStepAssembly`): one root product plus one named, placed child
+  per instance — instance separation survives the file (STL stays a single
+  fused mesh). Instance separation stays in
+  the assembly scene/document for the fuse paths.
+  Face selection matches `describe()` plane normals (outermost along ±normal)
+- **Client**: esbuild single-file CJS factory (three.js inlined ~560KB, react provided
+  by the host module table), Z-up CAD convention, empty scene with XYZ axis labels
+  and a ground grid always displayed
+
+## Theming (dark mode)
+
+The viewer follows the host appearance automatically. DSH publishes the theme as
+`color-scheme` on `<html>` plus `body[data-ds-dark-theme]`; the plugin resolves
+that (falling back to `prefers-color-scheme`) and themes every surface the host
+tokens cannot reach:
+
+- the viewport slab behind the transparent WebGL canvas and 2D scenes,
+- default 2D entity strokes (DXF / engineering-drawing entities),
+- the Three.js ground grid, XYZ axis triad/labels, feature edges, default mesh
+  color and sketch overlays,
+- the ViewCube face plate (canvas texture).
+
+A theme flip restyles mounted cards and the resident panel live — no reload and
+no lost camera. Engineering drawings loaded as SVG keep a white sheet; in dark
+mode it is framed as paper on the dark slab instead of filling the viewport.
+
+Hosts can override the surfaces the plugin owns; an explicit definition wins in
+either theme:
+
+| CSS variable | Applies to | Default |
+| --- | --- | --- |
+| `--dsh-cad-bg` | viewport background (any CSS `background` value) | light `#f5f6f8→#e9ecf0`, dark `#1b1b1c→#151517` |
+| `--dsh-cad-stroke` | default 2D entity stroke | `#4c5561` light / `#c8ced6` dark |
+| `--dsh-cad-paper` | drawing paper behind SVG sheets | `#ffffff` |
+
+```css
+:root { --dsh-cad-bg: #0b0d10; }          /* flat canvas in both themes */
+```
+
+## Tests
+
+```sh
+npm test                             # full suite: converters / modeling worker (exact volume assertions) / DCPRT round-trip / FreeCAD + Onshape executors / image profiles / binary pipeline / document persistence
+node test/route-check.mjs            # JSON scene routing layer
+node test/visual/serve.mjs           # browser card/tab visual verification page (http://127.0.0.1:3987)
+```
+
+Representative assertions covered: the boolean-punched volume exactly equals the
+analytic value (28429.20 mm³), L-shaped profile extrusion 3000 mm³, volumes and
+bounding-box flips of sphere/cone/torus placed with `at`/`axis`, 8-byte alignment
+of the binary packing, an STL export round-trip (export → read back by the
+phase-1 parser), and a DCPRT document round-trip (serialize → replay on the
+OCCT worker → exact bounds).
+
+## Known Limitations
+
+- DWG (closed-source) is unsupported; DXF bulge arcs are approximated by chords;
+  glTF/3MF viewing is not implemented (the structure is reserved)
+- `cad_fillet` is all-edge constant-radius (per-edge selection is unstable under
+  embind); chamfer is not implemented
+- Sketch extrusion supports polygon profiles only (arc profiles are constructed by
+  boolean combinations of cylinders/tori)
+- dsh framework limitation: an already-mounted single slot (the right-side details
+  panel itself) does not respond to components registered later, so the persistent
+  view is provided as the "3D" view tab (a list slot, the official composition)
+- The host reads CAD files via node:fs (the platform fs service supports UTF-8 text
+  only and cannot carry binary data)
+
+## Community
+
+| QQ Group (🇨🇳 China) | Feishu (🇨🇳 China) | X / Twitter (🌍 International) | Discord (🌍 International) |
+| --- | --- | --- | --- |
+| `485038246` (join note: dsh-cad) | 🚧 Coming soon | 🚧 Coming soon | 🚧 Coming soon |
+
+<!-- TODO: fill in the X handle / Discord invite link before publishing -->
+
+## Contributors
+
+Auto-generated from the commit history — thanks to everyone who has contributed!
+
+[![Contributors](https://contrib.rocks/image?repo=LAU-MARS/dsh-cad)](https://github.com/LAU-MARS/dsh-cad/graphs/contributors)
+
+## License
+
+MIT

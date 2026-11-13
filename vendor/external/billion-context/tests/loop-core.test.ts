@@ -1,0 +1,664 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import type { Config, CoreMessage } from "acp-kernel";
+import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
+import type { Session } from "../src/session.ts";
+import { runCompressLoop, createResponsesAdapter, createOpenaiAdapter, MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
+import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
+import { createHandoffReply } from "../src/server/handoff-response.ts";
+import type { WireProtocol } from "../src/util.ts";
+import { isTransientUpstreamError, REPLAY_MAX_ATTEMPTS, replayBackoffMs, replayMaxAttempts } from "../src/fetch-util.ts";
+
+function makeCtx(messages: CoreMessage[] = [], protocol?: WireProtocol): {
+    core: ReturnType<typeof createCore>;
+    config: Config;
+    messages: CoreMessage[];
+    session: Session;
+    log: (m: string) => void;
+    proxyUrl?: string;
+    textProtocol?: boolean;
+    protocol?: WireProtocol;
+} {
+    return {
+        core: createCore(),
+        config: { modelContextLimit: 200000 } as Config,
+        messages,
+        session: {
+            id: "loop-core-test",
+            meta: {},
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+            metadata: {},
+            state: createInitialState(),
+            createdAt: Date.now(),
+            lastSeen: Date.now(),
+            blockContents: new Map(),
+            inFlight: 0,
+            persisted: false,
+            pendingRetrievals: [],
+        },
+        log: () => {},
+        protocol,
+    };
+}
+
+function sse(type: string, data: unknown): string {
+    return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+async function drain(
+    stream: ReadableStream<Uint8Array>,
+    ctx: ReturnType<typeof makeCtx>,
+    requestBody: Record<string, unknown>,
+    requestOptions: { url: string; headers: Record<string, string> },
+    systemPrompt = buildCompressSystemPrompt(),
+): Promise<string> {
+    const chunks: Buffer[] = [];
+    for await (const chunk of runCompressLoop(stream, ctx, requestBody, requestOptions, createResponsesAdapter(), systemPrompt)) {
+        chunks.push(chunk);
+    }
+    return Buffer.concat(chunks).toString("utf8");
+}
+
+function fcEvents(outputIndex: number, callId: string, name: string, args: string): string {
+    return [
+        sse("response.output_item.added", { item: { type: "function_call", id: `fc_${callId}`, call_id: callId, name }, output_index: outputIndex }),
+        sse("response.function_call_arguments.delta", { item_id: `fc_${callId}`, delta: args }),
+        sse("response.output_item.done", { item: { type: "function_call", id: `fc_${callId}`, call_id: callId, name, arguments: args }, output_index: outputIndex }),
+    ].join("");
+}
+
+test("handoff uses the loop's parsed output without changing client bytes", async () => {
+    const raw = sse("response.output_text.delta", { type: "response.output_text.delta", item_id: "msg_reply", delta: "loop answer" })
+        + fcEvents(1, "call_read", "read", '{"path":"file.ts"}') + COMPLETED;
+    const ctx = makeCtx([], "responses");
+    const baseline = await drain(new Response(raw).body!, makeCtx([], "responses"), { input: [], stream: true }, { url: "http://mock", headers: {} });
+    const reply = createHandoffReply(ctx.session);
+    const chunks: Buffer[] = [];
+    for await (const chunk of runCompressLoop(new Response(raw).body!, { ...ctx, reply }, { input: [], stream: true }, { url: "http://mock", headers: {} }, createResponsesAdapter(), buildCompressSystemPrompt())) chunks.push(chunk);
+    assert.equal(Buffer.concat(chunks).toString(), baseline);
+    const saved = (ctx.session.metadata.handoffResponse as { messages: CoreMessage[] }).messages;
+    assert.equal(saved.find((m) => m.contentType === "text")?.text, "loop answer");
+    assert.equal(saved.find((m) => m.contentType === "tool-call")?.text, '{"path":"file.ts"}');
+    assert.equal(ctx.session.lastMessages, undefined);
+});
+
+test("handoff retains forwarded continuation text and omits a failed terminal", async () => {
+    const frame = (content: string, finish_reason: string | null = null) => `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason }] })}\n\n`;
+    const originalFetch = globalThis.fetch;
+    try {
+        for (const fails of [false, true]) {
+            globalThis.fetch = async () => fails
+                ? new Response(frame("unfinished"))
+                : new Response(frame(" tail", "stop") + "data: [DONE]\n\n");
+            const ctx = makeCtx([], "openai");
+            const body = { messages: [], stream: true };
+            const reply = createHandoffReply(ctx.session);
+            for await (const _chunk of runCompressLoop(new Response(frame("head")).body!, { ...ctx, reply }, body, { url: "http://mock", headers: {} }, createOpenaiAdapter(body), buildCompressSystemPrompt())) {}
+            const saved = ctx.session.metadata.handoffResponse as { messages: CoreMessage[] } | undefined;
+            if (fails) assert.equal(saved, undefined);
+            else assert.equal(saved?.messages.filter((m) => m.contentType === "text").map((m) => m.text).join(""), "head tail");
+        }
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+const COMPLETED = sse("response.completed", { response: { id: "resp_done", status: "completed", output: [] } });
+
+test("loop #1: acp_status-only round → marker surfaced + re-request (avoids tool_calls-no-body hang)", async () => {
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_status", "acp_status", "{}"),
+        COMPLETED,
+    ].join("");
+    const round2 = COMPLETED;
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(round2, { status: 200 }); }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(out.includes("[ACP]"), "acp_status visibility marker surfaced to client");
+        assert.ok(/response\.completed/.test(out), "graceful completion present (no 炸锅)");
+        assert.equal(fetchCalls, 1, "re-request after acp_status so model can continue (not finish_reason=tool_calls with no body)");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+test("loop #2: search_context-only round → marker surfaced + re-request", async () => {
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_search", "search_context", JSON.stringify({ query: "auth", limit: 3 })),
+        COMPLETED,
+    ].join("");
+    const round2 = COMPLETED;
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(round2, { status: 200 }); }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(out.includes("[ACP]"), "search_context marker surfaced");
+        assert.ok(/response\.completed/.test(out), "graceful completion present");
+        assert.equal(fetchCalls, 1, "re-request after search_context so model can use results");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+// #714: search_context before any compress used to surface "No blocks matched"
+// with a ❌ failure icon, driving premature-search retry loops. Zero active
+// blocks must render as a non-failure empty-state message instead.
+test("loop #714: search_context with zero blocks → empty-state marker, NOT ❌", async () => {
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_search", "search_context", JSON.stringify({ query: "anything" })),
+        COMPLETED,
+    ].join("");
+    const round2 = COMPLETED;
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(round2, { status: 200 }); }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(out.includes("No compressed blocks exist yet"), "empty-state message surfaced");
+        assert.ok(out.includes("🔍"), "search icon, not failure");
+        assert.ok(!out.includes("❌"), "NOT rendered as a failure");
+        assert.equal(fetchCalls, 1, "re-request so model can continue");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+test("loop #8: real-tool passthrough → emitted to client, loop ends (no re-request)", async () => {
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_bash", "bash", JSON.stringify({ command: "ls" })),
+        COMPLETED,
+    ].join("");
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(round1, { status: 200 }); }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(out.includes("\"name\":\"bash\""), "real tool call emitted to client");
+        assert.ok(/response\.completed/.test(out), "completion present (loop ended)");
+        assert.equal(fetchCalls, 0, "NO re-request: real tool ends the loop");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+test("loop #9: mixed compress + real tool → forwarded (no re-request), compress executed, marker shown", async () => {
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_compress", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] })),
+        fcEvents(1, "call_bash", "bash", JSON.stringify({ command: "echo hi" })),
+        COMPLETED,
+    ].join("");
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(round1, { status: 200 }); }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(out.includes("[ACP]"), "compress marker shown");
+        assert.ok(out.includes("\"name\":\"bash\""), "real tool forwarded to client");
+        assert.equal(fetchCalls, 0, "NO re-request: real tool present alongside mutating proxy tool");
+        assert.ok(/response\.completed/.test(out), "completion present");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+test("loop #5: limit-hit graceful — 10 re-request rounds never degenerate empty, no crash", async () => {
+    // acp_status drives the re-request path without tripping the failed-only
+    // breaker (#156/#4186), so this fixture actually reaches the loop limit.
+    const mutatingRound = [
+        sse("response.created", { response: { id: "resp_m", status: "in_progress" } }),
+        fcEvents(0, "call_status", "acp_status", "{}"),
+        COMPLETED,
+    ].join("");
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(mutatingRound, { status: 200 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(mutatingRound, { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(/response\.completed/.test(out), "graceful completion at limit (NOT degenerate empty)");
+        assert.ok(!/^data: \[\]\n\n$/.test(out), "no degenerate empty payload");
+        const completedCount = (out.match(/event: response\.completed/g) || []).length;
+        assert.equal(completedCount, 1, "exactly one completion event (one SSE event line)");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+// #5220 (history #156/#4186): a failed-only mutating round NO LONGER ends the
+// turn. The failure is fed back to the model as a plain assistant recovery
+// receipt — bytes identical to the ❌ marker already streamed to the client —
+// so the model decides what to do next instead of a fabricated "length"
+// finish silently killing a running task (no client on any wire auto-
+// continues "length"). The retry body must NOT carry this round's ephemeral
+// tool frames (#1548/#4186 seam): receipt only. Bounded by the restored #156
+// narrow breaker: re-submitting the IDENTICAL failing call (same signature)
+// is pure ping-pong and still breaks — that is exactly what this fixture
+// produces on round 2, so it runs ONE re-request then completes.
+test("loop #5220: failed-only compress round → recovery-receipt re-request, identical resubmit breaks", async () => {
+    const failingRound = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] })),
+        COMPLETED,
+    ].join("");
+    let fetchCalls = 0;
+    const bodies: string[] = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+        fetchCalls++;
+        if (init?.body !== undefined) bodies.push(String(init.body));
+        return new Response(failingRound, { status: 200 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(failingRound, { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 1, "first-time failure re-requests ONCE (recovery receipt); the identical round-2 resubmit hits the #156 signature breaker");
+        assert.ok(/response\.completed/.test(out), "graceful completion present (not degenerate empty)");
+        assert.ok(out.includes("❌"), "failure receipt surfaced to the client so the reason survives the turn");
+        const body = bodies[0]!;
+        assert.ok(body.includes("❌"), "retry body carries the recovery receipt as assistant text");
+        assert.ok(!body.includes("function_call") && !body.includes("call_c"), "ephemeral failed frames stay off the wire (#1548/#4186) — receipt only");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+// #156 guard: a failing compress that is NOT the model's only action this round
+// must not trigger the early break (the model may still be making progress).
+test("loop #156 guard: failing compress + other proxy call → no early break", async () => {
+    const mixedRound = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] })),
+        fcEvents(1, "call_status", "acp_status", "{}"),
+        COMPLETED,
+    ].join("");
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(mixedRound, { status: 200 }); }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(mixedRound, { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(/response\.completed/.test(out), "graceful completion present");
+        assert.equal(fetchCalls, MAX_LOOP_ROUNDS - 1, "NOT broken early: ran to the normal loop limit");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+// Regression guard: the server's runCompressLoop caller used to build LoopCtx
+// WITHOUT `protocol`, so recordUsage treated every protocol as Anthropic-style
+// (prompt + cached) and double-counted cached tokens for OpenAI/Responses
+// streams. The responses adapter reports input_tokens as the TOTAL (cached
+// already included) — assert both the fixed path (protocol set) and the
+// documented default (protocol unset → legacy additive behavior).
+const USAGE_COMPLETED = sse("response.completed", {
+    response: {
+        id: "resp_usage",
+        status: "completed",
+        output: [],
+        usage: {
+            input_tokens: 1000,
+            output_tokens: 10,
+            input_tokens_details: { cached_tokens: 900 },
+        },
+    },
+});
+
+test("loop usage: protocol='responses' → cached NOT double-counted (input_tokens is the total)", async () => {
+    const ctx = makeCtx([], "responses");
+    await drain(
+        new Response(USAGE_COMPLETED, { status: 200 }).body!,
+        ctx,
+        { model: "gpt-4o", input: [], stream: true },
+        { url: "http://mock", headers: {} },
+    );
+    assert.equal(ctx.session.stats.inputTokens, 1000, "total = input_tokens (1000), NOT 1900");
+    assert.equal(ctx.session.stats.lastInputTokens, 1000);
+    assert.equal(ctx.session.stats.cachedTokens, 900);
+    assert.equal(ctx.session.stats.cacheSamples, 1);
+});
+
+for (const completion of ["text", "tool"] as const) {
+    for (const placement of ["empty-delta-tail", "empty-choices-tail", "finish"] as const) {
+        test(`#4943: OpenAI ${completion} ${placement} usage settles once and replaces the stale anchor`, async () => {
+            const ctx = makeCtx([], "openai");
+            ctx.session.stats.lastInputTokens = 1000;
+            ctx.session.stats.lastUsageGradeTokens = 1000;
+            const body = { model: "m", messages: [], stream: true, stream_options: { include_usage: true } };
+            const frame = (value: unknown): string => `data: ${JSON.stringify(value)}\n\n`;
+            let totalInput = 0;
+            for (let turn = 1; turn <= 2; turn++) {
+                const prompt = 50000 * turn;
+                const usage = { prompt_tokens: prompt, completion_tokens: 10, total_tokens: prompt + 10, prompt_tokens_details: { cached_tokens: 4096 } };
+                const delta = completion === "tool"
+                    ? { tool_calls: [{ index: 0, id: "call_ping", type: "function", function: { name: "ping", arguments: "{}" } }] }
+                    : { content: "hello world" };
+                const finishReason = completion === "tool" ? "tool_calls" : "stop";
+                const finish = frame({ choices: [{ index: 0, delta: {}, finish_reason: finishReason }], ...(placement === "finish" ? { usage } : {}) });
+                const tail = placement === "finish" ? "" : frame({ choices: placement === "empty-choices-tail" ? [] : [{ index: 0, delta: {} }], usage });
+                const raw = frame({ choices: [{ index: 0, delta }] }) + finish + tail + "data: [DONE]\n\n";
+                const chunks: Buffer[] = [];
+                for await (const part of runCompressLoop(
+                    new Response(raw).body!, ctx, body, { url: "http://mock", headers: {} },
+                    createOpenaiAdapter(body), buildCompressSystemPrompt(),
+                )) chunks.push(part);
+                totalInput += prompt;
+                assert.equal(ctx.session.stats.lastInputTokens, prompt);
+                assert.equal(ctx.session.stats.lastUsageGradeTokens, prompt);
+                assert.equal(ctx.session.stats.inputTokens, totalInput);
+                assert.equal(ctx.session.stats.outputTokens, 10 * turn);
+                assert.equal(ctx.session.stats.cachedTokens, 4096 * turn);
+                assert.equal(ctx.session.stats.cacheSamples, turn);
+                const output = Buffer.concat(chunks).toString("utf8");
+                if (completion === "tool") {
+                    const usageFrame = tail || finish;
+                    assert.equal(output.split(usageFrame).length - 1, 1, "client receives the original usage frame exactly once");
+                    assert.ok(output.indexOf(usageFrame) < output.indexOf("data: [DONE]"));
+                    if (tail) assert.ok(output.indexOf(tail) > output.indexOf(finish));
+                } else {
+                    assert.ok(output.includes("hello world"));
+                }
+            }
+        });
+    }
+}
+
+test("loop usage: protocol unset → legacy additive behavior (prompt + cached)", async () => {
+    const ctx = makeCtx();
+    await drain(
+        new Response(USAGE_COMPLETED, { status: 200 }).body!,
+        ctx,
+        { model: "gpt-4o", input: [], stream: true },
+        { url: "http://mock", headers: {} },
+    );
+    assert.equal(ctx.session.stats.inputTokens, 1900, "no protocol → prompt + cached (1000 + 900)");
+    assert.equal(ctx.session.stats.cachedTokens, 900);
+});
+
+// Regression guard for #189: after a compress, the acp-loop replay request can
+// be rejected by provider risk-control (GLM Coding Plan returns 400
+// {"code":3007,"msg":"captcha verify failed"} ~1s after a big context rewrite).
+// The replay must auto-retry with backoff instead of surfacing the error into
+// the agent session.
+const CAPTCHA_400_BODY = '{"code":3007,"msg":"captcha verify failed"}';
+
+// summary must be ≥ minSummaryLength (50) for the round to succeed.
+function compressRound(): string {
+    return [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "Replay fold summary: shapes verified, deltas recorded, seams absent." }] })),
+        COMPLETED,
+    ].join("");
+}
+
+// Seeded so the compress round SUCCEEDS — a failing compress completes after
+// round 1 with no re-request (#4186), which would skip the replay under test.
+// Three non-obvious requirements: full kernel config (the bare makeCtx cast
+// lacks compress.minCompressRange → TypeError), refs pre-mapped via assignRefs
+// (the loop never mints them — server-side prepare does), and turns 2–4 padded
+// past preserveRecentTokens so turn 1 escapes the protected zone.
+function replayCtx(): ReturnType<typeof makeCtx> {
+    const ctx = makeCtx();
+    const filler = (i: string, pad: number) => `filler ${i} paragraph body. `.repeat(pad);
+    const msgs: CoreMessage[] = [];
+    for (let t = 1; t <= 4; t++) {
+        msgs.push({ id: `u${t}`, role: "user", contentType: "text", text: filler(`u${t}`, t === 1 ? 110 : 160) });
+        msgs.push({ id: `a${t}`, role: "assistant", contentType: "text", text: filler(`a${t}`, t === 1 ? 110 : 160) });
+    }
+    ctx.messages = msgs;
+    ctx.config = defaultConfig(200_000);
+    ctx.session.state.messageRefs = assignRefs(msgs, { existing: emptyRefMap(), nextIndex: 0 }).map;
+    return ctx;
+}
+
+test("replay retry: transient 400 (captcha) then success → retried, no error surfaced", async () => {
+    process.env.BILI_REPLAY_RETRY_BASE_MS = "1";
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        if (fetchCalls === 1) return new Response(CAPTCHA_400_BODY, { status: 400 });
+        return new Response(COMPLETED, { status: 200 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(compressRound(), { status: 200 }).body!,
+            replayCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 2, "replay retried once after transient 400");
+        assert.ok(!out.includes("upstream error"), "no upstream error surfaced to client");
+        assert.ok(/response\.completed/.test(out), "graceful completion after retry");
+    } finally {
+        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+        globalThis.fetch = orig;
+    }
+});
+
+test("replay retry: persistent captcha 400 → bounded retries, error names attempt count", async () => {
+    process.env.BILI_REPLAY_RETRY_BASE_MS = "1";
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(CAPTCHA_400_BODY, { status: 400 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(compressRound(), { status: 200 }).body!,
+            replayCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, REPLAY_MAX_ATTEMPTS, "retries are bounded");
+        assert.ok(out.includes("upstream error 400"), "error surfaced to client");
+        assert.ok(out.includes(`after ${REPLAY_MAX_ATTEMPTS} attempt(s)`), "attempt count in error message");
+    } finally {
+        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+        globalThis.fetch = orig;
+    }
+});
+
+test("replay retry: fatal 400 (invalid model) → NO retry, fail fast", async () => {
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response('{"error":{"message":"Invalid model"}}', { status: 400 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(compressRound(), { status: 200 }).body!,
+            replayCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 1, "non-transient 4xx is not retried");
+        assert.ok(out.includes("upstream error 400"), "error surfaced to client");
+        assert.ok(!out.includes("attempt(s)"), "no attempt-count suffix on single-attempt failure");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+test("replay retry: 429 then success → retried", async () => {
+    process.env.BILI_REPLAY_RETRY_BASE_MS = "1";
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        if (fetchCalls === 1) return new Response('{"error":"rate limited"}', { status: 429 });
+        return new Response(COMPLETED, { status: 200 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(compressRound(), { status: 200 }).body!,
+            replayCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 2, "429 retried");
+        assert.ok(!out.includes("upstream error"), "no upstream error surfaced to client");
+    } finally {
+        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+        globalThis.fetch = orig;
+    }
+});
+
+test("isTransientUpstreamError: classifier matrix", () => {
+    assert.equal(isTransientUpstreamError(400, CAPTCHA_400_BODY), true, "captcha 400 is transient");
+    assert.equal(isTransientUpstreamError(400, '{"error":{"message":"Invalid model"}}'), false, "plain 400 is not");
+    assert.equal(isTransientUpstreamError(401, ""), false, "401 never retried");
+    assert.equal(isTransientUpstreamError(429, ""), true, "429 always retried");
+    assert.equal(isTransientUpstreamError(500, ""), true, "5xx always retried");
+    assert.equal(isTransientUpstreamError(503, "service unavailable"), true);
+    assert.equal(isTransientUpstreamError(200, "captcha"), false, "2xx never classified");
+    assert.equal(REPLAY_MAX_ATTEMPTS, 3);
+});
+
+// Regression guard for #3606: risk-control gateways return 400 whose body
+// machine-declares retryability (code 11101, actions:["RETRY"]) or uses the
+// canonical "Please retry" / 「请重试」 phrasing — none of which hit the
+// original seven markers, so every such rejection failed fast instead of
+// being replayed.
+const RETRY_DECLARED_400_BODY = JSON.stringify({ error: { message: JSON.stringify({
+    code: 11101,
+    msg: "Parse message failed: unsupported content type at index 0: tool_use",
+    requestId: "req-test",
+    displayMsg: { en: "Bad request.", zh: "请求不合法" },
+    actions: ["RETRY", "SUBMIT_FEEDBACK"],
+}) } });
+
+test("isTransientUpstreamError: explicit retry declarations (#3606)", () => {
+    assert.equal(isTransientUpstreamError(400, RETRY_DECLARED_400_BODY), true, 'JSON-string-wrapped actions:["RETRY"] 400 is transient');
+    assert.equal(isTransientUpstreamError(400, '{"code":11101,"actions":["RETRY","SUBMIT_FEEDBACK"]}'), true, "flat actions:[RETRY] 400 is transient");
+    assert.equal(isTransientUpstreamError(400, '{"error":{"retryable":true,"message":"temporary"}}'), true, "nested retryable:true 400 is transient");
+    assert.equal(isTransientUpstreamError(400, '{"message":"please retry later"}'), true, '"please retry" wording is transient');
+    assert.equal(isTransientUpstreamError(400, '{"displayMsg":{"en":"Invalid request. Please retry","zh":"请求内容不合法，请重试"},"msg":"x"}'), true, "Please retry / 请重试 wording is transient");
+    // negatives: only unambiguous machine signals or canonical phrasing count
+    assert.equal(isTransientUpstreamError(400, '{"message":"invalid api_key, do not retry"}'), false, '"do not retry" stays non-transient');
+    assert.equal(isTransientUpstreamError(400, '{"retryable":"true"}'), false, 'string "true" is not a boolean declaration');
+    assert.equal(isTransientUpstreamError(400, '{"actions":["SUBMIT_FEEDBACK"]}'), false, "actions without RETRY is not transient");
+    assert.equal(isTransientUpstreamError(400, "not json at all"), false, "non-JSON body without markers is not transient");
+});
+
+test("replay retry: upstream-declared transient 400 then success → retried (#3606)", async () => {
+    process.env.BILI_REPLAY_RETRY_BASE_MS = "1";
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        if (fetchCalls === 1) return new Response(RETRY_DECLARED_400_BODY, { status: 400 });
+        return new Response(COMPLETED, { status: 200 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(compressRound(), { status: 200 }).body!,
+            replayCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 2, "declared-transient 400 retried once");
+        assert.ok(!out.includes("upstream error"), "no upstream error surfaced to client");
+    } finally {
+        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+        globalThis.fetch = orig;
+    }
+});
+
+test("replayBackoffMs: exponential from env-tunable base", () => {
+    process.env.BILI_REPLAY_RETRY_BASE_MS = "100";
+    try {
+        assert.equal(replayBackoffMs(1), 100);
+        assert.equal(replayBackoffMs(2), 200);
+        assert.equal(replayBackoffMs(3), 400);
+    } finally {
+        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+    }
+    assert.equal(replayBackoffMs(1), 1500, "default base is 1500ms");
+});
+
+test("replayMaxAttempts: env-tunable total attempts (1 = legacy no-retry)", () => {
+    for (const [value, expected] of [["1", 1], ["5", 5], ["0", REPLAY_MAX_ATTEMPTS], ["abc", REPLAY_MAX_ATTEMPTS], ["-2", REPLAY_MAX_ATTEMPTS]] as const) {
+        if (value === "abc") delete process.env.BILI_REPLAY_RETRY_MAX;
+        else process.env.BILI_REPLAY_RETRY_MAX = value;
+        try {
+            assert.equal(replayMaxAttempts(), expected, `BILI_REPLAY_RETRY_MAX=${value}`);
+        } finally {
+            delete process.env.BILI_REPLAY_RETRY_MAX;
+        }
+    }
+    assert.equal(replayMaxAttempts(), REPLAY_MAX_ATTEMPTS, "default is 3");
+});
+
+test("replay retry: BILI_REPLAY_RETRY_MAX=1 → legacy fail-fast (no retry)", async () => {
+    process.env.BILI_REPLAY_RETRY_MAX = "1";
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(CAPTCHA_400_BODY, { status: 400 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(compressRound(), { status: 200 }).body!,
+            replayCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 1, "MAX=1 disables retries (legacy behavior)");
+        assert.ok(out.includes("upstream error 400"), "error surfaced to client");
+        assert.ok(!out.includes("attempt(s)"), "no attempt-count suffix on single attempt");
+    } finally {
+        delete process.env.BILI_REPLAY_RETRY_MAX;
+        globalThis.fetch = orig;
+    }
+});

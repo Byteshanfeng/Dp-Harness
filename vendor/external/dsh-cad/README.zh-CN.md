@@ -1,0 +1,287 @@
+# dsh-cad — CAD Plugin for DeepSeek Harness
+
+![dsh-cad banner](docs/img/banner.svg)
+
+[![homepage](https://img.shields.io/badge/homepage-dsh--cad-4D6BFE)](https://lau-mars.github.io/dsh-cad/)
+[![npm](https://img.shields.io/npm/v/dsh-cad)](https://www.npmjs.com/package/dsh-cad)
+[![downloads](https://img.shields.io/npm/dm/dsh-cad)](https://www.npmjs.com/package/dsh-cad)
+[![dsh](https://img.shields.io/npm/v/@deepseek-ai%2Fdsh?label=dsh)](https://www.npmjs.com/package/@deepseek-ai/dsh)
+[![Node](https://img.shields.io/badge/node-%3E%3D%2022-4D6BFE)](https://nodejs.org/)
+[![occt](https://img.shields.io/badge/occt-7.9.3-4D6BFE)](https://github.com/LAU-MARS/opencascade-ts)
+[![occt.ts](https://img.shields.io/npm/v/occt.ts?label=occt.ts)](https://www.npmjs.com/package/occt.ts)
+[![ansatz](https://img.shields.io/npm/v/ansatz-wasm?label=ansatz)](https://www.npmjs.com/package/ansatz-wasm)
+[![License: MIT](https://img.shields.io/badge/license-MIT-4D6BFE)](./LICENSE)
+
+[English](./README.md) | 简体中文
+
+[DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) 的 CAD 插件：
+在 Web UI 中提供**内嵌 3D/2D CAD 查看器**与**原生参数化建模工具族**（OCCT 内核），
+让 agent 能够"边建边看"地完成 CAD 工作。
+
+## 预览
+
+一次完整的建模会话：在对话中直接搭参数化装配体——先建 120×80×8、四角 R5
+圆角的底板，再在四角放置 4 个螺栓实例——右侧常驻 CAD 面板全程实时跟踪
+（带逐实例配色的零件树、ViewCube、"装配体"页签、5 实例 · 1,740 三角形）。
+完成后导出结构化 STEP 文档，agent 回读文件自检——2 个实体、3 个产品、
+2 个装配引用、1,125.00 mm³：
+
+![dsh-cad 装配建模会话](docs/img/assembly-preview.png)
+
+## 下载量
+
+npm 官方源的累计下载量，由 CI 每日刷新：
+
+![npm 累计下载量](docs/img/downloads-cumulative.svg)
+
+## 功能总览
+
+| 能力 | 说明 |
+| --- | --- |
+| ⚙️ 内核链：cadorange → occt.ts | 建模经 **[cadorange](https://github.com/LAU-MARS/cadorange)**（agent 原生 CAD 运行时，底层 occt.ts/OCCT WASM；公共 API + 官方 `cadorange/occt` 逃生口承担网格/HLR/线构造），occt.ts 直连保留为回退层级——`DSH_CAD_KERNEL` 可显式指定（opencascade.js 档已于 v0.15.1 移除，安装体积 −64MB）。旧版的「抽壳后不可编辑」接缝消失——抽壳/拔模后可继续圆角/倒角/布尔 |
+| 🔍 CAD 查看 | STL / OBJ / STEP / IGES / BREP / DCPRT（3D），DXF / SVG（2D），右侧常驻面板交互视口（轨道旋转 / 缩放 / 线框 / 平移），对话中只留一行结果摘要 |
+| 🌗 深色模式绘制面 | 所有绘制面跟随宿主主题——视口底板、DXF/工程图描边、Three.js 网格 / XYZ 轴 / 特征边 / 默认网格色 / 草图覆盖层，以及 ViewCube 面板；主题切换实时重绘已挂载的查看器。覆盖钩子：`--dsh-cad-bg`、`--dsh-cad-stroke`、`--dsh-cad-paper` |
+| 🧭 CAD 编辑器交互 | Onshape 风格 ViewCube（26 区域点击定向）、悬停/点选面与边实时测量（面积 mm² / 长度 mm）、面+边 / 面 / 线框三种渲染模式、支架 / 法兰 / 轴 BRep 示例件一键切换 |
+| 🏗️ 参数化建模 | 基本体、轮廓拉伸、**放样**、**扫掠**、**旋转体**、布尔、全边圆角/倒角、**抽壳**、**拔模**、**阵列（线性/圆周）**、变换；轮廓支持**曲线段**（圆弧/圆为精确 BRep，B 样条为采样近似）—— OCCT 精确 BRep，非网格近似 |
+| ✏️ 命名草图 | 文档中独立的可命名轮廓（Sketch1…）：`cad_sketch_new` / `edit` / `list` / `delete`；拉伸/旋转/扫掠**按名字引用**，`cad_sketch_edit` 原位改写定义并全量重放，所有引用特征级联重建——参数化闭环。草图以 Onshape 式**蓝色曲线 + 平面框**在视口中实时渲染（回改即刷新），并列于零件页签左侧的**特征树**（草图 + 特征、眼睛显隐、点选高亮实体） |
+| 🗂️ Codex 式文档页签 | 按需从右侧边栏打开 CAD；新会话保持边栏关闭。页签栏 + 「+」菜单提供**零件**（Part Studio，默认）/ **装配体**（实例插入/移动/移除）/ **工程图**（真实隐藏线图纸），页签可关闭、常驻不丢状态 |
+| 🔩 关节驱动的装配体 | build123d 关节族（刚性/旋转/滑动/圆柱/球面/平面/极坐标）：`cad_assembly_joint` 定义、`cad_assembly_connect` 配对求解（父侧固定、子侧重定位至关节帧重合）、`cad_assembly_drive` 驱动运动值并级联重解算（运动仿真）、`cad_assembly_explode` 爆炸视图；装配树面板新增 JOINTS 区（类型/当前值/配对链接）；纯主线程位姿代数，与内核无关、随操作日志重放 |
+| 📥 STEP 装配导入 | `cad_step_import` 结构化导入 STEP 装配文档：部件名/嵌套结构/实例位姿保留，相同几何自动去重为一个体被 N 实例引用（螺栓阵列即一个体）；文件按内容寻址缓存为工作区资产，操作日志重放自洽（cadorange 内核） |
+| 📁 多文档 file 空间 | 工作区命名的建模文档（`.dsh-cad/docs/`），每个会话绑定自己的活动文档——新会话从空文档开始，不再继承历史遗留零件；面板上的文件夹按钮列出全部文档（预览 / 删除），对话中用 `cad_doc_new` / `cad_doc_open` 切换建模目标 |
+| 📐 工程图 | GB 第一角布局：主视图 / 俯视图 / 左视图 + 轴测图，**occt.ts** 内核（npm 依赖）真实隐藏线消除（虚线）；图框、标题栏、总尺寸标注、标准比例系列；导出 SVG / DXF |
+| 🔗 约束求解与运动 | 集成 **Ansatz** 几何约束求解器（**`ansatz-wasm` 一条命令即可**：`npm install ansatz-wasm`，零 Rust 工具链 / 零原生二进制 / 零依赖）：实体/约束建模（装配实例 ↔ rigid3 位姿自动映射）、求解回写、DOF/残差/冗余/建议全量诊断（面向 LLM 的中文报告）、参数扫描运动学（`cad_constraint` / `cad_solve` / `cad_motion`） |
+| 📐 几何测量 | 精确体积（mm³）、包围盒、三角统计、DXF 图层 |
+| 📤 按需导出 | STEP（参数化）/ STL（网格），仅在用户要求时写文件 |
+| 🖥️ 常驻 CAD 显示区 | 会话页右侧常驻面板：Codex 式页签（零件 / 装配体 / 工程图），建模时实时跟踪最新模型 |
+| ⚡ 直通渲染管道 | worker 网格 → 内存二进制 → three.js typed-array，零 base64 / 零中间文件 / 零每步落盘 |
+| 💾 建模文档持久化 | 操作日志（JSON）+ 防抖磁盘镜像，进程重启后自动重放恢复 |
+| 🖼️ 图片 → 轮廓 | PNG 草图/截图 → Otsu 二值化 → 轮廓追踪 → 可直接拉伸的多边形（`cad_image_profile`） |
+| 🔌 FreeCAD 执行器 | 在外部 FreeCAD 控制台运行同一 op 族（STEP 输入/输出闭环）；需本地安装 |
+| ☁️ Onshape 执行器 | 经**签名 REST API** 在 **Onshape** 云端运行同一 op 族——零本地安装：每个 op 编译为一个**标准 Onshape 特征**推入目标 Part Studio（无需 Feature Studio 配置）。回传分三级：默认按零件的廉价 STL、`readback: "step"` 精确 BRep 命名网格（服务端 STEP 翻译 + 本地 OCCT 解析）、`readback: "none"` 只建模型回文档链接（约 3 次调用，最省配额）。导出支持 `.stl` / `.step` / `.x_t`（Parasolid 原生内核 BRep）。配额感知错误区分密钥问题与免费档冷却；始终返回 Onshape 文档链接 |
+
+## 安装
+
+插件已发布到 npm，一行命令即可：
+
+```sh
+dsh plugin --profile web add dsh-cad
+```
+
+安装器会通过 `dsh.bundle` 清单自动应用包内自带的 `cordis.patch.yml`，无需手工改任何配置。
+
+### 版本要求
+
+- **Node.js** 与 **dsh CLI**（`@deepseek-ai/dsh`）的最低版本以顶部徽章和
+  `package.json` 的 `engines` 字段为准——正文不再写具体版本号，避免过时
+
+### 从源码安装（开发模式）
+
+```sh
+git clone https://github.com/LAU-MARS/dsh-cad.git
+cd dsh-cad
+npm install && npm run build && npm test   # 依赖含 occt.ts（工程图真实消隐内核，~20MB wasm）
+
+npm install -g @deepseek-ai/dsh pnpm
+dsh web                                  # 首次启动初始化 profile 后 Ctrl-C
+
+dsh plugin --profile web add /path/to/dsh-cad
+
+dsh web
+```
+
+patch 内容以包根目录的 `cordis.patch.yml` 随包分发，安装器经同一条 `dsh.bundle` 清单自动应用。
+
+设置 `DEEPSEEK_API_KEY` 后对话即可使用，例如：
+
+- “打开 bracket.stl 看看” → `cad_view`
+- “画一个 100×60×5 的板，中间打 ⌀20 孔，四角 R2 圆角，加 ⌀16 高 20 凸台，导出 plate.step”
+  → `cad_create_prim` + `cad_boolean` + `cad_fillet` + `cad_export`，每步 3D 页签实时更新
+- “堆一个雪人” → 球体 + 圆锥鼻子 + 圆柱帽子（`at`/`axis` 精确定位）
+- “再放两个 b1，一个转到 90 度” → `cad_assembly_insert` + `cad_assembly_move`，装配体页签实时更新
+- “给 b1 出一张 A3 工程图，导出 dxf” → `cad_drawing`（三视图 + 轴测 + 虚线隐藏线 + 尺寸标注）→ `cad_export` `.dxf`
+
+## 模型工具族
+
+| 工具 | 说明 |
+| --- | --- |
+| `cad_view` | 打开 CAD 文件，渲染交互式查看器卡片 |
+| `cad_info` | 只读几何元信息（格式/数量/包围盒/单位/图层） |
+| `cad_create_prim` | 基本体（mm，Z-up），`at` 定位、`axis` 定向（精确轴角旋转） |
+| `cad_sketch_new` | 新建命名草图（Sketch1…）：{start, segments} / {circle} / 平面点列——供轮廓特征按名引用 |
+| `cad_sketch_edit` | 回改草图：定义 op 原位改写 + 日志全量重放，所有引用特征级联重建 |
+| `cad_sketch_list` | 列出文档草图（名称 / 形式 / 规模） |
+| `cad_sketch_delete` | 删除草图（仍被特征引用时拒绝） |
+| `cad_extrude_profile` | XY 平面闭合轮廓沿 +Z 拉伸成实体——内联点列/曲线段/圆，或引用命名草图（`sketch`） |
+| `cad_loft` | 放样：多个闭合截面（[x,y,z…] 点环，或 `{through}` 样条 / 平面 `{profile}` 曲线截面）蒙皮成体，截面形状/点数可不同；`smooth: true` 用周期 B 样条拟合点环，得到单一连续侧面（零折痕）；`ruled` 直纹 |
+| `cad_revolve` | 旋转体：闭合轮廓绕轴回转（profile 坐标 = (半径, 高度)，支持曲线段——圆角轮缘精确），`angle` 角度可选；可引用命名草图 |
+| `cad_chamfer` | 倒角：全锐边等距离斜切（mm） |
+| `cad_pattern` | 阵列：线性（delta 间距）或圆周（主轴 + at 轴点 + 总角度），生成副本体，可再 fuse 合并 |
+| `cad_shell` | 抽壳：壁厚向内生长、外表面保留；`open` 为开口面的外法向列表（空 = 封闭内腔）。经 occt.ts 内核执行，结果为**托管体** |
+| `cad_draft` | 拔模：壁面绕中性面倾斜 `angle` 度（脱模斜度），`direction` 为拔模方向，默认自动选平行于该方向的壁面。经 occt.ts 内核执行，结果为**托管体** |
+| `cad_sweep` | 扫掠：闭合 2D 轮廓沿 3D 路径（[x,y,z…]）扫出实体；轮廓自动置于路径起点垂面，无需手工定向；可引用命名草图 |
+| `cad_boolean` | fuse / cut / common（经典打孔：plate cut cylinder） |
+| `cad_fillet` | 全锐边等半径圆角 |
+| `cad_transform` | 平移 / 欧拉旋转 / 镜像 |
+| `cad_volume` | 精确 BRep 体积（mm³） |
+| `cad_drawing` | 工程图：主/俯/左 + 轴测四视图，隐藏线（虚线）、图框、标题栏、总尺寸、标准比例，A4/A3 |
+| `cad_assembly_insert` | 将零件以实例插入装配体（`at` 定位、`rotate` 定向） |
+| `cad_assembly_move` | 设置实例绝对位置/姿态 |
+| `cad_assembly_remove` | 从装配体移除实例（零件保留） |
+| `cad_assembly_joint` | 在实例上定义关节（build123d 关节族：刚性/旋转/滑动/圆柱/球面/平面/极坐标），帧位于实例局部坐标 |
+| `cad_assembly_connect` | 关节配对求解放置：父侧固定、子实例重定位使两关节帧重合（可选 connect 时驱动值） |
+| `cad_assembly_drive` | 驱动关节运动值并重解算全部配对（运动仿真一步；范围校验） |
+| `cad_assembly_solve` | 按当前关节值重解算全部配对（手动移动父件后调用） |
+| `cad_assembly_explode` | 爆炸视图系数（实例沿径向偏离装配中心；仅视图态，导出/图纸不受影响） |
+| `cad_assembly_info` | 读取装配态：实例位姿 + 关节标签/类型/值 + 配对关系 + 爆炸系数 |
+| `cad_step_import` | STEP 结构化导入：名称/部件结构/实例位姿保留，相同几何去重为一个体被 N 实例引用 |
+| `cad_constraint` | 声明约束模型：实体（含装配实例绑定）+ 约束（distance/angle/mate/coaxial…），持久化于操作日志 |
+| `cad_solve` | Ansatz 求解并回写装配位姿；返回 DOF 剩余/残差/冗余/建议全量诊断 |
+| `cad_motion` | 运动学扫描：驱动一个约束值从 from 到 to 逐帧求解，应用末帧位姿并返回运动表 |
+| `cad_export` | 导出 STEP / STL / DCPRT（原生可重放零件文档）到工作区路径；`target: "assembly"` 导出装配体 STEP，`target: "drawing"` 导出工程图 SVG / DXF |
+| `cad_delete` | 删除 body |
+| `cad_docs` | 列出工作区建模文档（id / 名称 / 体数 / 更新时间，标记当前活动文档） |
+| `cad_doc_new` | 新建命名文档并设为会话建模目标（多零件项目从这里开始） |
+| `cad_doc_open` | 打开已有文档（按 id 或名称）作为会话建模目标——body 精确重放 |
+| `cad_doc_rename` | 重命名文档 |
+| `cad_doc_delete` | 永久删除文档（需 `confirm: true`） |
+| `cad_freecad` | 在外部 FreeCAD 执行器上运行 op 程序（可选 STEP 输入/导出） |
+| `cad_fusion` | 在外部 Fusion 360 执行器上运行 op 程序（GUI 桥；可选导出） |
+| `cad_onshape` | 在 Onshape 云端运行 op 程序（签名 REST API）：新建或驱动文档、返回文档链接；`readback: "step"` 回传精确 BRep 网格；导出 `.stl` / `.step` / `.x_t`（Parasolid） |
+| `cad_image_profile` | PNG → 轮廓 → 可直接拉伸的多边形点集 |
+| `cad_script` | 确定性脚本求值（轮廓点列/圆弧坐标等几何计算）：`js` 在进程内 Node vm 运行（无需 shell——宿主 shell 不可用时仍可用），`py` 走系统 Python |
+
+每步建模后：对话中的结果行原地更新（稳定 viewId + 版本化 URL），
+右侧 "零件" 页签实时跟踪最新模型。
+
+## 连接器（规划中）
+
+建模经 **cadorange** 跑在 **occt.ts** 内核上（浏览器内的 OCCT 内核，零安装）；
+下表连接器指未来以**外部 CAD 引擎作为执行器**驱动同一工具族：
+
+| 连接器 | 套件 | 平台 | 状态 |
+| --- | --- | --- | --- |
+| **内置内核** | 基于 OCCT + WebGL 的 CAD 建模内核，浏览器内运行——零安装 | 全平台（WebGL 渲染） | ✅ 内置 |
+| FreeCAD | 开源参数化套件——可经其 Python API 作为本地执行器（控制台 + GUI 窗口双模式） | Windows / macOS / Linux | ✅ 可用（需本地安装） |
+| Fusion 360 | Autodesk CAD/CAM——常驻 Add-In + spool 桥（无 headless，Fusion 窗口即查看器） | Windows / macOS | 🧪 实验性（`cad_fusion`） |
+| SolidWorks | 达索系统的主流 3D CAD，COM/.NET 自动化 | 仅 Windows | 🚧 Windows demo 脚手架（`scripts/solidworks-bridge/`） |
+| Onshape | PTC 云原生 SaaS CAD，完全在浏览器——签名 REST API（cad.onshape.com 或私有 chamber 域名）；每个 op 编译为标准 Onshape 特征推入 Part Studio，结果按零件回传 STL + 质量属性，云端即查看器 | 全平台（浏览器） | ✅ 可用（`cad_onshape`；设置 `DSH_ONSHAPE_ACCESS_KEY` / `DSH_ONSHAPE_SECRET_KEY`） |
+| 中望3D（ZW3D） | 中望软件的一体化 CAD/CAM | Windows / Linux | 🚧 规划中 |
+| 浩辰3D | 浩辰软件的 3D CAD | Windows | 🚧 规划中 |
+
+所有外部引擎实现同一 **GeometryExecutor 契约**（`available()` / `run(op程序) → 网格`），
+WebGL 显示层因此永不改变——更换后端只影响生成几何的质量。
+
+## 架构
+
+```
+cad_view(path)                        建模工具（cad_create_prim 等）
+  → 导入 worker（occt-import-js）       → 建模 worker（cadorange / occt.ts WASM）
+  → CadScene JSON（base64-f32）         → BRep 精确几何 + 网格化
+  → GET /dsh-cad/scene/<id>            → 内存二进制场景（f32/u32 打包）
+                                        → GET /dsh-cad/bin/<docId>
+            ↓ 会话 presentationMeta（viewId + 版本化 URL）↓
+        浏览器卡片 + 常驻 "3D" 页签（three.js / SVG，Z-up，XYZ 轴）
+```
+
+- **两个 worker**：导入（occt-import-js，只读 STEP/IGES/BREP）与建模（cadorange
+  over occt.ts wasm）分离，均惰性启动
+- **直通管道**：建模场景零 base64 / 零 JSON 大数组 / 零每步落盘（磁盘镜像 1.5s 防抖，
+  仅服务重启回放）；`cad_export` 是唯一的显式文件导出
+- **建模文档**：`<workspace>/.dsh-cad/model.json` 操作日志，重启后重放恢复全部 body
+- **工程图消隐内核**：隐藏线由 **occt.ts**（npm 依赖，`npm i occt.ts`）执行
+  真实 OCCT 消隐，无替代引擎、缺失即报错。内核 API：
+  `hiddenLines()` 真实消隐线、STEP/BRep 字节级 `readStep`/`readBrep`/`writeStep`/
+  `writeBrep`（无需 MEMFS）、自带特征边提取的网格化、`hasError()`/`lastError()`
+  错误契约。几何以 STEP 字节跨内核交换，投影线段重映射进图纸坐标系。内核 dist
+  解析顺序：`DSH_OCCTJS_DIST` 环境变量 → Node 自带的 `occt.ts` 依赖解析（沿所有
+  父级 node_modules 向上查——npm/yarn 扁平安装与 pnpm 符号链接布局都能命中）→
+  `<repo>/../opencascade-ts/dist`（兄弟检出）→ `vendor/` →
+  `node_modules/opencascade-ts`
+- **约束求解（Ansatz）**：求解器是 npm 依赖 **`ansatz-wasm`**（wasm-bindgen
+  构建，单包 ~538KB、零依赖）——安装 dsh-cad 即自动获得，也可单独
+  `npm install ansatz-wasm` 升级；**无需 Rust 工具链、无需原生二进制、跨平台**。
+  解析顺序：npm 包（node_modules）→ `DSH_ANSATZ_WASM` 目录 → 兄弟 Ansatz 检出的
+  pkg-node。求解器以 JSON 信封契约通信，工具层错误（`unsupported_constraint` 等）
+  原样透出给 LLM。装配实例位姿（平移 + XYZ 欧拉度）与求解器 rigid3（平移 + 指数映射
+  旋转，弧度）双向映射。求解器能力按阶段推进（当前支持点到原点距离），管道契约
+  已就绪、无需随求解器成长改动
+- **内核链**：建模经 **cadorange**（agent 原生 CAD 运行时；build123d 风格
+  公共 API 承担 prims/曲线段轮廓（真 BSpline 插值）/放样/扫掠/旋转/布尔
+  （默认同域清理）/圆角/倒角/抽壳/拔模/原生镜像/质心，官方 `cadorange/occt`
+  逃生口承担查看器网格、工程图 HLR（零 STEP 中转、单一 wasm 会话）与线构造）；
+  occt.ts 直连保留为回退层级（`DSH_CAD_KERNEL` 可显式指定，
+  动词级映射见 docs/cadorange-integration.md）。抽壳后继续编辑无缝。
+  装配体 STEP 导出为**结构化文档**（cadorange
+  `writeStepDocument`）：一个根产品 + 每实例一个命名、带位姿的子产品——
+  实例分离在文件中保留（STL 仍为单一熔合网格；降级后端同样走 fuse）。fuse
+  路径下实例分离仅保留在装配场景/文档中。面选择按 `describe()` 平面法向
+  匹配（±法向取外侧投影最大者）
+- **客户端**：esbuild 单文件 CJS 工厂（three.js 内联 ~560KB，react 由宿主模块表提供），
+  Z-up CAD 惯例，带 XYZ 轴标签与地面网格的空场景常驻显示
+
+## 主题（深色模式）
+
+查看器自动跟随宿主外观。DSH 通过 `<html>` 上的 `color-scheme` 与
+`body[data-ds-dark-theme]` 发布主题；插件据此解析（无信号时回退到
+`prefers-color-scheme`），并为主题 token 覆盖不到的所有绘制面着色：
+
+- 透明 WebGL 画布与 2D 场景背后的视口底板；
+- 2D 实体默认描边（DXF / 工程图实体）；
+- Three.js 地面网格、XYZ 轴与轴标签、特征边、默认网格色与草图覆盖层；
+- ViewCube 面板贴图（canvas 纹理）。
+
+主题切换会实时重绘已挂载的卡片与右侧常驻面板——无需刷新，也不丢失视角。
+以 SVG 载入的工程图仍是一张白纸：深色模式下它作为「纸」被框在深色底板上，
+而不是占满整个视口。
+
+宿主可覆盖插件自有的绘制面（显式定义在明暗两种主题下都优先）：
+
+| CSS 变量 | 作用 | 默认值 |
+| --- | --- | --- |
+| `--dsh-cad-bg` | 视口背景（任意 CSS `background` 值） | 浅色 `#f5f6f8→#e9ecf0`，深色 `#1b1b1c→#151517` |
+| `--dsh-cad-stroke` | 2D 实体默认描边 | 浅色 `#4c5561` / 深色 `#c8ced6` |
+| `--dsh-cad-paper` | SVG 图纸背后的纸面 | `#ffffff` |
+
+```css
+:root { --dsh-cad-bg: #0b0d10; }          /* 两种主题下都使用纯色底板 */
+```
+
+## 测试
+
+```sh
+npm test                             # 全套：转换器 / 建模 worker（体积精确断言）/ DCPRT 往返 / FreeCAD + Onshape 执行器 / 图片轮廓 / 二进制管道 / 文档持久化
+node test/route-check.mjs            # JSON 场景路由层
+node test/visual/serve.mjs           # 浏览器卡片/页签视觉验证页（http://127.0.0.1:3987）
+```
+
+覆盖的代表性断言：布尔打孔体积精确等于解析值（28429.20 mm³）、L 型轮廓拉伸
+3000 mm³、球/锥/环带 `at`/`axis` 定位的体积与包围盒翻转、二进制打包 8 字节对齐、
+STL 导出往返（导出 → 一期解析器读回），以及 DCPRT 文档往返
+（序列化 → OCCT worker 重放 → 精确包围盒）。
+
+## 已知限制
+
+- DWG（闭源）不支持；DXF bulge 弧以弦线近似；glTF/3MF 查看未实现（结构已预留）
+- `cad_fillet` 为全边等半径（embind 下按边选择不稳定）；chamfer 未实现
+- 草图拉伸仅支持多边形轮廓（圆弧轮廓用布尔组合圆柱/圆环构造）
+- dsh 框架限制：已挂载的 single 槽（右侧 details 面板本体）不响应后注册组件，
+  故常驻显示区以 "3D" 视图页签提供（list 槽，官方组合方式）
+- 宿主读取 CAD 文件使用 node:fs（平台 fs 服务仅支持 UTF-8 文本，无法承载二进制）
+
+## 社区
+
+| QQ 群（🇨🇳 国内） | 飞书群（🇨🇳 国内） | X / Twitter（🌍 国际） | Discord（🌍 国际） |
+| --- | --- | --- | --- |
+| `485038246`（加群备注 dsh-cad） | 🚧 敬请期待 | 🚧 敬请期待 | 🚧 敬请期待 |
+
+<!-- TODO: 发布前填入 X 账号 / Discord 邀请链接 -->
+
+## 贡献者
+
+由提交历史自动生成，感谢每一位贡献者！
+
+[![Contributors](https://contrib.rocks/image?repo=LAU-MARS/dsh-cad)](https://github.com/LAU-MARS/dsh-cad/graphs/contributors)
+
+## License
+
+MIT

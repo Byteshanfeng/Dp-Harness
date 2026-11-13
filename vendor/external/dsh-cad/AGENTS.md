@@ -1,0 +1,117 @@
+# AGENTS.md — 本地开发 / 启动注意事项
+
+面向 coding agent（及人类）的本地环境要点，来自实际踩坑记录（2026-09-06，v0.2.0 拉取后的重启）。
+
+## 标准启动流程
+
+```sh
+git pull
+npm install        # 关键：见下方「occt.ts 上游依赖」
+npm run build      # 关键：见下方「link 模式必须重新构建」
+# 若 3080 被旧实例占用，先 kill（见下方「端口占用」）
+dsh web            # http://127.0.0.1:3080
+```
+
+## 多文档 file 空间（2026-09-06 起）
+
+建模文档不再是一整个工作区共享的单例，而是命名的文档集合：
+
+- 存储：`<workspace>/.dsh-cad/docs/<docId>.json` + 清单 `index.json`
+  （含 `sessionBindings`：会话 → 活动文档）。旧的单文件 `model.json`
+  会在首次加载时自动迁移为「导入的模型」文档，并由第一个建模的会话认领。
+- 会话绑定：每个聊天会话（工具 `exec.agent.id`）绑定一个活动文档；
+  新会话首个建模操作自动落在**新的空文档**上（不再继承旧零件）。
+  切换文档 = reset worker + 重放该文档 ops（交错会话会触发重放，正确但慢）。
+- 工具：`cad_docs`（列表）/ `cad_doc_new`（新建+切换）/ `cad_doc_open`
+  （打开+重放）/ `cad_doc_rename` / `cad_doc_delete`（需 confirm=true）。
+- UI：CAD 面板页签栏的文件夹按钮 → 工作区文档列表（点击预览、行尾删除
+  二次确认）；数据来自 `GET /dsh-cad/docs`，删除走
+  `POST /dsh-cad/docs/delete?id=`。点击仅预览——切换建模目标要在对话里说
+  「打开 xx 文档」。
+
+## 踩坑记录
+
+### 1. occt.ts 上游依赖（最重要）
+
+工程图（`cad_drawing`）的真 HLR 隐藏线内核跑在 **occt.ts**（npm 包，~20MB wasm）上，
+这是**硬依赖——缺失即报错，没有降级引擎**。它追踪上游最新版，`package.json`
+里版本号会随功能演进而提升，因此：
+
+- **每次 `git pull` 之后必须重新 `npm install`**。本次踩坑：拉取 v0.2.0 后
+  `node_modules/occt.ts` 不存在（新引入的依赖），不装直接构建/启动会失败。
+- 安装后确认内核 dist 就位：`ls node_modules/occt.ts/dist`（应含 `cli.js` 等）。
+- 内核 dist 解析顺序（`src/modeling/occt-bridge.cjs`）：
+  `DSH_OCCTJS_DIST` 环境变量 → Node 自带的 `occt.ts` 依赖解析
+  （require.resolve 沿所有父级 node_modules 向上查，npm/yarn 扁平安装与
+  pnpm 符号链接布局均命中）→ `node_modules/occt.ts/dist`（仓库根直接布局）
+  → `<repo>/../opencascade-ts/dist`（同级 checkout）→ `vendor/`
+  → `node_modules/opencascade-ts`。
+  若要试用上游未发布的新特性，可 checkout opencascade-ts 到仓库同级目录，
+  或设 `DSH_OCCTJS_DIST` 指向其 dist，无需改代码。
+
+### 2. link 模式：改代码 / 拉代码后必须重新构建
+
+web profile 通过 `"dsh-cad": "link:/Users/kane/work/dsh-cad"` 链接本仓库
+（见 `~/.dsh/profiles/web/package.json`）。dsh 加载的是 **`lib/` 构建产物**，
+不是 `src/`——pull 或改码后不跑 `npm run build`，页面跑的还是旧代码。
+
+### 2b. lib/ 已提交入库（v0.12.2 起）——发布前必须重建并提交
+
+dsh 插件管理器从 **git 仓库 URL** 安装（`pnpm add https://github.com/...`），
+而 pnpm 10+/11 默认拦截依赖的构建脚本（allowBuilds），`prepare` 钩子行不通。
+因此 `lib/` 构建产物**直接提交进仓库**（.gitignore 不再忽略），git 安装开箱
+即用。**每次发布：`npm run build` → 连同 lib/ 一起提交 → 打 tag / publish。**
+改了 `src/` 或 `client/` 却没重新构建提交 lib/，git 安装的用户跑的就是旧代码。
+
+### 3. 端口 3080 被旧实例占用（EADDRINUSE）
+
+`dsh web` 监听 `127.0.0.1:3080`。之前启动的实例可能一直挂着（本次遇到一个
+跑了 6 天的），再次启动会报：
+
+```
+Error: failed to apply loader entry webserver: listen EADDRINUSE: 127.0.0.1:3080
+```
+
+处理：
+
+```sh
+lsof -nP -iTCP:3080 -sTCP:LISTEN   # 找到旧实例 PID（确认是 dsh web 再杀）
+kill <PID>
+dsh web
+```
+
+加 `--no-open` 可避免启动时自动开浏览器。
+
+### 4. 非交互 shell 里 node / dsh 不在 PATH
+
+本机 node 由 **nvm** 管理（`~/.nvm/versions/node/`，需 ≥22，当前用 v22.23.2），
+非交互 shell（CI、脚本、agent 的裸 bash）不会加载 nvm，`node`/`npm`/`dsh`
+全部 command not found。解决：
+
+```sh
+export PATH="$HOME/.nvm/versions/node/v22.23.2/bin:$PATH"
+```
+
+### 5. cadorange 0.10.0 发布包的 exports 指向 src（2026-10-29 踩坑）
+
+npm 上的 cadorange@0.10.0 包内 `package.json` 的 exports 指向 `./src/*.ts`，
+而包里只带了 `dist/`（publishConfig 未在发布时生效）——`require.resolve('cadorange')`
+直接失败，内核桥接会静默落到兄弟 checkout（无 checkout 的环境则降级直连内核）。
+**已在 `cadorange-bridge.cjs` 加固**：解析链在 Node 依赖解析失败后手动逐级探测
+`<node_modules>/cadorange/dist`（pnpm 符号链接同样命中）。验证：
+
+```sh
+node -e "console.log(require('./src/modeling/cadorange-bridge.cjs').resolveCadorangeDist())"
+# 期望输出 …node_modules\cadorange\dist
+```
+
+上游若发修复版本（exports 指回 dist），该探测成为无害兜底。
+
+`dsh` CLI（0.1.1-rc.2，满足 engines 要求）装在该 node 的全局 `node_modules` 下，
+PATH 修正后即可用。
+
+## 快速验证
+
+- 服务健康：`curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3080/` → `200`
+- 测试套件：`npm test`（含 drawing / assembly 的 41+ 用例）
+- 浏览器卡片可视化：`node test/visual/serve.mjs`（http://127.0.0.1:3987）
